@@ -1,10 +1,11 @@
-//! clicky — daemon + CLI control.
+//! clicky — settings app + headless daemon + CLI control.
 //!
-//! `clicky` / `clicky --daemon` runs the engine headless (T14 adds the
-//! settings window). `clicky enable|disable|profile <id>|status|quit` talks
-//! to a running daemon over its Unix control socket. `--diagnostics` prints
-//! devices, evdev access and audio host/buffer info. `--input-probe` /
-//! `--audio-probe` re-exec the dev probes shipped next to this binary.
+//! `clicky` launches the Tauri settings window with the engine running
+//! in-process (T14). `clicky --daemon` runs the engine headless.
+//! `clicky enable|disable|profile <id>|status|quit` talks to a running
+//! daemon over its Unix control socket. `--diagnostics` prints devices,
+//! evdev access and audio host/buffer info. `--input-probe` / `--audio-probe`
+//! re-exec the dev probes shipped next to this binary.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -16,11 +17,13 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::BufferSize;
 
 mod daemon;
+mod ipc;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        None | Some("--daemon") => daemon::run(),
+        None => ipc::run_app(),
+        Some("--daemon") => daemon::run(),
         Some("--diagnostics") => diagnostics(),
         Some("--input-probe") => probe("input_probe"),
         Some("--audio-probe") => probe("audio_probe"),
@@ -39,8 +42,8 @@ fn usage_err(msg: &str) -> i32 {
         "clicky: {msg}\n\
          \n\
          usage:\n\
-         \x20 clicky                  run daemon (autostart/foreground)\n\
-         \x20 clicky --daemon         same, explicit\n\
+         \x20 clicky                  open the settings window (engine in-process)\n\
+         \x20 clicky --daemon         headless engine (autostart)\n\
          \x20 clicky --diagnostics    device list, permission check, buffer sizes\n\
          \x20 clicky enable|disable   toggle sounds on the running daemon\n\
          \x20 clicky profile <id>     switch sound profile\n\

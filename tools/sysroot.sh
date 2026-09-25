@@ -16,6 +16,12 @@ for r in "$SYS/dl"/*.rpm; do (cd "$SYS" && rpm2cpio "$r" | cpio -idmu --quiet); 
 for pc in "$SYS"/usr/lib64/pkgconfig/*.pc "$SYS"/usr/share/pkgconfig/*.pc; do
   [ -f "$pc" ] && sed -i "s|^prefix=/usr$|prefix=$SYS/usr|; s|^libdir=/usr/lib64\$|libdir=$SYS/usr/lib64|; s|^includedir=/usr/include\$|includedir=$SYS/usr/include|; s|^datadir=/usr/share\$|datadir=$SYS/usr/share|" "$pc"
 done
+# pkg-config searches directories, not subdirs: symlink share/pkgconfig .pc
+# files into lib64/pkgconfig so one PKG_CONFIG_PATH entry covers everything
+# (cargo's relative-path env absolutizes only the first path-list component).
+for pc in "$SYS"/usr/share/pkgconfig/*.pc; do
+  [ -f "$pc" ] && ln -sf "../../share/pkgconfig/$(basename "$pc")" "$SYS/usr/lib64/pkgconfig/"
+done
 # dev symlinks (libfoo.so -> libfoo.so.N) need the real runtime libs they name
 for so in "$SYS"/usr/lib64/*.so; do
   tgt="$(readlink "$so" 2>/dev/null || true)"; [ -z "$tgt" ] && continue

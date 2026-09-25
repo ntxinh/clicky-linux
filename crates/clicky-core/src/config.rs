@@ -307,7 +307,12 @@ impl Default for VisualizerTheme {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VisualizerSettings {
+    /// Master switch for the overlay subsystem.
     pub enabled: bool,
+    /// Per-kind enable flags — keys are kind names ("keyboard",
+    /// "keystrokes", "combo", "bezel", "keyboard3d"). Absent = off.
+    #[serde(default)]
+    pub kinds: HashMap<String, bool>,
     pub style: VisualizerStyle,
     pub placement: VisualizerPlacement,
     pub theme: VisualizerTheme,
@@ -327,6 +332,7 @@ impl Default for VisualizerSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            kinds: HashMap::new(),
             style: VisualizerStyle::Keyboard,
             placement: VisualizerPlacement::Cursor,
             theme: VisualizerTheme::Graphite,

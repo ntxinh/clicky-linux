@@ -1,14 +1,15 @@
-//! Headless daemon: engine loop + Unix control socket.
+//! Engine boot shared by the headless daemon (`run()`) and the Tauri app
+//! (`ipc.rs`), plus the daemon's Unix control socket.
 //!
 //! Boot order: config → staged manifest → audio stream → register samples →
-//! input thread → control socket. Missing evdev access is degraded, never
-//! fatal: the daemon serves enable/disable/profile/status/quit while
-//! `input::run`'s sustained retry poll picks the nodes up once permissions
-//! land (the udev rule emits no hotplug event for already-enumerated nodes).
+//! input thread. Missing evdev access is degraded, never fatal: the daemon
+//! serves enable/disable/profile/status/quit while `input::run`'s sustained
+//! retry poll picks the nodes up once permissions land (the udev rule emits
+//! no hotplug event for already-enumerated nodes).
 //!
 //! Socket: `$XDG_RUNTIME_DIR/clicky/control.sock` — one line per connection,
 //! one reply line back. `status` replies with a JSON object; everything else
-//! replies `ok`/`err <msg>`. This is the future DMS-keybind/tray path (T14).
+//! replies `ok`/`err <msg>`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -50,54 +51,60 @@ pub fn socket_path() -> PathBuf {
     socket_dir().join("control.sock")
 }
 
-/// `~/.local/share/clicky/sounds`, falling back to `./sounds` for dev runs.
-fn sounds_dir() -> PathBuf {
+/// `~/.local/share/clicky/sounds`, falling back to `./sounds` for dev runs
+/// (and `../../sounds` under `tauri dev`, which starts in crates/clicky).
+pub fn sounds_dir() -> PathBuf {
     if let Some(p) = directories::ProjectDirs::from("io", "clicky", "clicky") {
         let d = p.data_dir().join("sounds");
         if d.join("profiles.json").exists() {
             return d;
         }
     }
+    for cand in [PathBuf::from("sounds"), PathBuf::from("../../sounds")] {
+        if cand.join("profiles.json").exists() {
+            return cand;
+        }
+    }
     PathBuf::from("sounds")
 }
 
-/// State mutated by the socket handler (main thread) and read by the input
-/// thread: engine for `on_key`, store for `config.enabled`/saves.
-struct Shared {
-    engine: Engine,
-    store: Store,
+/// State mutated by the socket handler (main thread), IPC commands and the
+/// input thread: engine for `on_key`/`update_config`, store for saves.
+pub struct Shared {
+    pub engine: Engine,
+    pub store: Store,
 }
 
-/// Run the daemon in the foreground until `quit`, SIGTERM or SIGINT.
-/// Returns the process exit code.
-pub fn run() -> i32 {
-    install_signal_handlers();
+/// Everything [`boot`] produced that a caller needs past startup.
+pub struct Boot {
+    /// Engine + store behind one lock (IPC thread ≠ audio thread).
+    pub shared: Arc<Mutex<Shared>>,
+    /// Live output stream + shared mixer.
+    pub audio: Audio,
+    /// Remote gain/enable handle into the running mixer.
+    pub controls: MixerControls,
+    /// Where `profiles.json` was found; packs import into `<dir>/user/`.
+    pub sounds_dir: PathBuf,
+    /// Set to stop the input loop; join `input` before exit.
+    pub quit: Arc<AtomicBool>,
+    /// Input-thread liveness (`capture` field of status/diagnostics).
+    pub capture_alive: Arc<AtomicBool>,
+    /// evdev → Normalizer → Engine reader thread.
+    pub input: Option<std::thread::JoinHandle<()>>,
+}
 
-    let store = match Store::load(Store::default_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("clicky: config load failed: {e}");
-            return 1;
-        }
-    };
+/// Shared startup: load config, stage + register the manifest, start audio,
+/// spawn the input thread. Used by both `run()` (daemon) and `ipc::run_app()`
+/// (Tauri). Returns a description of the failure — callers print and exit.
+pub fn boot() -> Result<Boot, String> {
+    let store = Store::load(Store::default_path()).map_err(|e| format!("config load failed: {e}"))?;
     let sounds = sounds_dir();
     // Stage outside the mixer lock; the stream is up by register time but
     // startup contention is nil.
-    let staged = match profiles::stage_manifest(&sounds) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("clicky: manifest {}: {e}", sounds.display());
-            return 1;
-        }
-    };
-    let (audio, producer, controls) =
-        match Audio::start(store.cfg.sound.output_device_uid.as_deref()) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("clicky: audio start failed: {e}");
-                return 1;
-            }
-        };
+    let staged = profiles::stage_manifest(&sounds)
+        .map_err(|e| format!("manifest {}: {e}", sounds.display()))?;
+    let (audio, producer, controls) = Audio::start(store.cfg.sound.output_device_uid.as_deref())
+        .map_err(|e| format!("audio start failed: {e}"))?;
     let report = {
         let mut mixer = audio.mixer().lock();
         profiles::register_manifest(staged, &mut mixer)
@@ -113,14 +120,13 @@ pub fn run() -> i32 {
         audio.out_rate(),
         audio.channels(),
     );
-    let profile_ids: Vec<String> = report.profiles.iter().map(|p| p.id.clone()).collect();
 
     controls.set_enabled(store.cfg.enabled);
     let engine = Engine::new(store.cfg.clone(), report.profiles, producer);
     let shared = Arc::new(Mutex::new(Shared { engine, store }));
 
     // Input thread: enumerate → run loop. EACCES-only enumeration leaves the
-    // daemon headless-but-alive; run()'s retry poll picks nodes up when perms
+    // app headless-but-alive; run()'s retry poll picks nodes up when perms
     // land.
     let enumerated = input::keyboard_devices();
     eprintln!(
@@ -132,15 +138,50 @@ pub fn run() -> i32 {
         eprintln!("clicky: {}: {}", i.path.display(), i.error);
     }
     let quit = Arc::new(AtomicBool::new(false));
-    // Input-thread liveness for `status`: set inside the reader loop, cleared
+    // Input-thread liveness for status: set inside the reader loop, cleared
     // when it exits — a dead loop must never report `capture: "live"`.
     let capture_alive = Arc::new(AtomicBool::new(false));
-    let input_handle = spawn_input(
+    let input = spawn_input(
         enumerated.keyboards,
         shared.clone(),
         quit.clone(),
         capture_alive.clone(),
     );
+
+    Ok(Boot {
+        shared,
+        audio,
+        controls,
+        sounds_dir: sounds,
+        quit,
+        capture_alive,
+        input: Some(input),
+    })
+}
+
+/// Stop the input thread and flush the store. Safe to call once at shutdown.
+pub fn shutdown(boot: &mut Boot) {
+    boot.quit.store(true, Ordering::Relaxed);
+    if let Some(h) = boot.input.take() {
+        let _ = h.join();
+    }
+    if let Err(e) = boot.shared.lock().store.flush() {
+        eprintln!("clicky: config save: {e}");
+    }
+}
+
+/// Run the daemon in the foreground until `quit`, SIGTERM or SIGINT.
+/// Returns the process exit code.
+pub fn run() -> i32 {
+    install_signal_handlers();
+
+    let mut b = match boot() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("clicky: {e}");
+            return 1;
+        }
+    };
 
     // Control socket: stale socket file gets reclaimed; a live one means a
     // second daemon — exit rather than double-consume evdev.
@@ -188,16 +229,15 @@ pub fn run() -> i32 {
     }
     eprintln!("clicky: control socket on {}", sock.display());
 
-    while !quit.load(Ordering::Relaxed) && !SIG_QUIT.load(Ordering::Relaxed) {
+    while !b.quit.load(Ordering::Relaxed) && !SIG_QUIT.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => handle(
                 stream,
-                &shared,
-                &controls,
-                &audio,
-                &profile_ids,
-                &quit,
-                &capture_alive,
+                &b.shared,
+                &b.controls,
+                &b.audio,
+                &b.quit,
+                &b.capture_alive,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
@@ -209,12 +249,7 @@ pub fn run() -> i32 {
         }
     }
 
-    quit.store(true, Ordering::Relaxed);
-    let _ = input_handle.join();
-    let mut sh = shared.lock();
-    if let Err(e) = sh.store.flush() {
-        eprintln!("clicky: config save: {e}");
-    }
+    shutdown(&mut b);
     let _ = std::fs::remove_file(&sock);
     eprintln!("clicky: quit");
     0
@@ -259,7 +294,6 @@ fn handle(
     shared: &Arc<Mutex<Shared>>,
     controls: &MixerControls,
     audio: &Audio,
-    profile_ids: &[String],
     quit: &Arc<AtomicBool>,
     capture_alive: &Arc<AtomicBool>,
 ) {
@@ -274,20 +308,11 @@ fn handle(
     let reply = match read {
         Err(_) => "err read".to_string(),
         Ok(0) => "err empty".to_string(),
-        Ok(_) => command(
-            line.trim(),
-            shared,
-            controls,
-            audio,
-            profile_ids,
-            quit,
-            capture_alive,
-        ),
+        Ok(_) => command(line.trim(), shared, controls, audio, quit, capture_alive),
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.write_all(b"\n");
 }
-
 
 /// Dispatch one command; returns the reply line (no newline).
 fn command(
@@ -295,7 +320,6 @@ fn command(
     shared: &Arc<Mutex<Shared>>,
     controls: &MixerControls,
     audio: &Audio,
-    profile_ids: &[String],
     quit: &Arc<AtomicBool>,
     capture_alive: &Arc<AtomicBool>,
 ) -> String {
@@ -326,10 +350,15 @@ fn command(
             "ok".into()
         }
         (Some("profile"), Some(id), None) => {
-            if !profile_ids.iter().any(|p| p == id) {
+            let mut sh = shared.lock();
+            if !sh
+                .engine
+                .profiles()
+                .iter()
+                .any(|p| p.id == *id)
+            {
                 return format!("err unknown profile {id}");
             }
-            let mut sh = shared.lock();
             let mut cfg = sh.store.cfg.clone();
             let prev = cfg.sound.profile_id.clone();
             cfg.sound.profile_id = id.to_string();

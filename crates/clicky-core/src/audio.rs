@@ -29,7 +29,7 @@ use crate::mixer::{Controls, Mixer, Stats, TriggerProducer};
 pub type MixerControls = Controls;
 
 /// Output-device descriptor for the device picker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceInfo {
     pub name: String,
     pub is_default: bool,
@@ -245,6 +245,13 @@ impl Audio {
         &BUFFER_ATTEMPTS
     }
 }
+
+// cpal stamps `platform::Stream` !Send/!Sync for WASAPI parity; on the ALSA
+// host (all we run on) `StreamInner` is Sync and the handle — a channel plus
+// the trigger fd — is movable, so sharing `Audio` behind a Mutex in Tauri
+// managed state is sound. No `Audio` method runs on the RT thread.
+unsafe impl Send for Audio {}
+unsafe impl Sync for Audio {}
 
 #[cfg(test)]
 mod tests {

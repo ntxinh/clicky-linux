@@ -210,6 +210,17 @@ impl Engine {
         }
     }
 
+    /// Append one profile (pack import): indices of existing profiles are
+    /// unchanged, normalization rebuilt, active re-resolved by id.
+    pub fn push_profile(&mut self, p: Profile) {
+        self.profiles.push(p);
+        let (norm, ceiling) =
+            derive_normalization(&self.profiles, self.config.sound.normalization);
+        self.norm = norm;
+        self.ceiling = ceiling;
+        self.active = active_index(&self.profiles, &self.config.sound.profile_id);
+    }
+
     /// Swap the loaded profile set (manifest reload): rebuild normalization
     /// and re-resolve the configured profile. In-flight release intents are
     /// kept — they hold frozen triggers, never sample indexes to re-resolve.
@@ -230,6 +241,11 @@ impl Engine {
             .unwrap_or("")
     }
 
+    /// Loaded profiles, in manifest order (the index space `set_profile`
+    /// accepts). IPC surfaces name/brand/color from here.
+    pub fn profiles(&self) -> &[Profile] {
+        &self.profiles
+    }
 
     /// Apply a new configuration. Re-derives normalization when the toggle
     /// changed, re-resolves the active profile when `profile_id` changed, and
@@ -332,18 +348,23 @@ impl Engine {
     /// paired release (a real hold isn't needed for a preview). Previews
     /// the PROFILE DEFAULT, like Clicky — key overrides don't apply.
     pub fn preview(&mut self, keyid: &str) {
-        if self.profiles.is_empty() {
+        self.preview_on(self.active, keyid);
+    }
+
+    /// `preview` against a specific profile index (library audition —
+    /// doesn't switch the active profile).
+    pub fn preview_on(&mut self, pidx: usize, keyid: &str) {
+        if pidx >= self.profiles.len() {
             return;
         }
         let (tone, pitch, volume) = {
             let s = &self.config.sound;
             (s.tone, s.pitch, s.volume)
         };
-        let press =
-            self.profile_trigger(self.active, Phase::Press, keyid, tone, pitch, volume, 0.0, None);
+        let press = self.profile_trigger(pidx, Phase::Press, keyid, tone, pitch, volume, 0.0, None);
         let shared = press.as_ref().map(|p| p.norm);
         let release =
-            self.profile_trigger(self.active, Phase::Release, keyid, tone, pitch, volume, 0.0, shared);
+            self.profile_trigger(pidx, Phase::Release, keyid, tone, pitch, volume, 0.0, shared);
         let (press, release) = self.pair(press, release);
         if let Some(p) = press {
             self.producer.push(p);
@@ -352,7 +373,6 @@ impl Engine {
             self.producer.push(r);
         }
     }
-
     /// Modifier gain/pitch for the modifier's own sound (224–231, L and R
     /// independent — the event's own usage decides).
     fn modifier_policy(&self, ev: &KeyEvent) -> (f32, Option<f32>) {
