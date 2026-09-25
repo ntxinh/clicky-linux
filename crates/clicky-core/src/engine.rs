@@ -533,6 +533,7 @@ mod tests {
             keys: HashMap::new(),
             levels,
             provenance: None,
+            warnings: Vec::new(),
         }
     }
 

@@ -75,6 +75,9 @@ pub struct Profile {
     pub levels: HashMap<u16, Level>,
     /// Optional provenance block, passed through untouched.
     pub provenance: Option<serde_json::Value>,
+    /// Non-fatal load/import warnings (e.g. unknown pack key names dropped).
+    /// Always empty for `profiles.json`-loaded profiles.
+    pub warnings: Vec<String>,
 }
 
 /// Mixer sample ids for one keyid's press/release override.
@@ -170,7 +173,7 @@ pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error>
 }
 
 /// Decoded-but-unregistered sample: `(resolved path, mono pcm, src_rate)`.
-type Staged = Vec<(PathBuf, Arc<[f32]>, u32)>;
+pub(crate) type Staged = Vec<(PathBuf, Arc<[f32]>, u32)>;
 
 /// Resolve one profile in two phases: decode + validate every file first
 /// (nothing touches the mixer), then — after a capacity pre-check against
@@ -238,12 +241,13 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
         keys,
         levels,
         provenance: raw.provenance,
+        warnings: Vec::new(),
     })
 }
 
 /// Resolve + decode a list of sample paths; any failure aborts the profile
 /// before anything is registered.
-fn stage_list(dir: &Path, paths: &[String]) -> Result<Staged, Error> {
+pub(crate) fn stage_list(dir: &Path, paths: &[String]) -> Result<Staged, Error> {
     paths
         .iter()
         .map(|rel| {
@@ -256,7 +260,7 @@ fn stage_list(dir: &Path, paths: &[String]) -> Result<Staged, Error> {
 
 /// Register staged PCM into the mixer; returns `(id, measured level)` pairs
 /// (rms/peak computed over the mono PCM, consumed by engine normalization).
-fn register_list(staged: Staged, mixer: &mut Mixer) -> Result<Vec<(u16, Level)>, Error> {
+pub(crate) fn register_list(staged: Staged, mixer: &mut Mixer) -> Result<Vec<(u16, Level)>, Error> {
     staged
         .into_iter()
         .map(|(path, pcm, rate)| {
