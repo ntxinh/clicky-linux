@@ -4,3 +4,4 @@ dist/
 
 # SDD/agent scratch
 .superpowers/
+.sysroot/
