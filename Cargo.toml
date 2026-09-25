@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/clicky-core", "crates/clicky", "crates/clicky-overlay"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"

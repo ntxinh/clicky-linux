@@ -1,0 +1,4 @@
+# clicky — grant the active seat user read access to keyboard event nodes.
+# logind applies a uaccess ACL to keyboards only (ID_INPUT_KEYBOARD), only
+# while the user's session is active. Install via tools/setup.sh.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"

@@ -1,3 +1,6 @@
 target/
 node_modules/
 dist/
+
+# SDD/agent scratch
+.superpowers/
