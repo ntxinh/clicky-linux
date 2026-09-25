@@ -246,6 +246,7 @@ fn spawn_input(
             },
             stop,
         );
+        alive.store(false, Ordering::Relaxed);
         if let Err(e) = result {
             eprintln!("clicky: input loop failed: {e}");
         }
@@ -309,13 +310,17 @@ fn command(
             let enable = cmd == "enable";
             let mut sh = shared.lock();
             let mut cfg = sh.store.cfg.clone();
+            let prev_enabled = cfg.enabled;
             cfg.enabled = enable;
-            // Apply to the live path first; a failed persist rolls the store
-            // back so status can never diverge from the engine.
+            // Apply to the live path first; a failed persist reverts engine,
+            // mixer and store so `err` genuinely means nothing changed.
             sh.engine.update_config(cfg.clone());
             controls.set_enabled(enable);
             if let Err(e) = sh.store.save_debounced(&cfg) {
-                sh.store.cfg.enabled = !enable;
+                sh.store.cfg.enabled = prev_enabled;
+                let prev_cfg = sh.store.cfg.clone();
+                sh.engine.update_config(prev_cfg);
+                controls.set_enabled(prev_enabled);
                 return format!("err {e}");
             }
             "ok".into()
@@ -331,6 +336,8 @@ fn command(
             sh.engine.update_config(cfg.clone());
             if let Err(e) = sh.store.save_debounced(&cfg) {
                 sh.store.cfg.sound.profile_id = prev;
+                let prev_cfg = sh.store.cfg.clone();
+                sh.engine.update_config(prev_cfg);
                 return format!("err {e}");
             }
             "ok".into()
