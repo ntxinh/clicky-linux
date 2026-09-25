@@ -61,10 +61,6 @@ fn def_combo_timeout() -> f64 {
 fn def_shortcut_usage() -> u32 {
     14 // HID usage K
 }
-fn def_shortcut_modifiers() -> u8 {
-    // Bit = modifier usage − 224; usage 227 (LGUI/Super) → bit 3.
-    1 << 3
-}
 fn def_tap_count() -> u32 {
     3
 }
@@ -340,15 +336,102 @@ impl VisualizerSettings {
     }
 }
 
-/// Toggle-shortcut: N taps of `usage` with exact `modifiers` mask inside
-/// `interval` seconds. `modifiers` bit = modifier usage − 224.
+/// Shortcut modifier mask, serialized as Clicky's `KeyModifiers` OptionSet:
+/// `{"rawValue": N}` with bits command=1, shift=2, option=4, control=8,
+/// function=16 (macOS labels; command≙GUI/Super, option≙Alt).
+///
+/// The engine's held-modifier mask is per-usage (bit = usage − 224, L/R
+/// distinct); this type is the L/R-collapsed form. Mapping:
+/// CONTROL ↔ usages 224/228, SHIFT ↔ 225/229, OPTION ↔ 226/230,
+/// COMMAND ↔ 227/231 (any held modifier of that kind sets the bit).
+/// FUNCTION (Clicky bit 16) has no page-7 usage in 224–231; it survives
+/// round-trips but never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutModifiers {
+    /// Clicky OptionSet raw value.
+    pub raw_value: u32,
+}
+
+impl ShortcutModifiers {
+    /// GUI/Super (Clicky `command`).
+    pub const COMMAND: Self = Self { raw_value: 1 };
+    /// Shift (Clicky `shift`).
+    pub const SHIFT: Self = Self { raw_value: 2 };
+    /// Alt (Clicky `option`).
+    pub const OPTION: Self = Self { raw_value: 4 };
+    /// Ctrl (Clicky `control`).
+    pub const CONTROL: Self = Self { raw_value: 8 };
+    /// Fn (Clicky `function`; no HID usage in 224–231).
+    pub const FUNCTION: Self = Self { raw_value: 16 };
+
+    /// Collapse an engine held-modifier mask (bit = usage − 224) into
+    /// Clicky kind bits — either side sets the bit.
+    pub fn from_held_mask(held: u8) -> Self {
+        let mut v = 0;
+        if held & 0b_0001_0001 != 0 {
+            v |= Self::CONTROL.raw_value; // 224 | 228
+        }
+        if held & 0b_0010_0010 != 0 {
+            v |= Self::SHIFT.raw_value; // 225 | 229
+        }
+        if held & 0b_0100_0100 != 0 {
+            v |= Self::OPTION.raw_value; // 226 | 230
+        }
+        if held & 0b_1000_1000 != 0 {
+            v |= Self::COMMAND.raw_value; // 227 | 231
+        }
+        Self { raw_value: v }
+    }
+
+    /// True if `held` (engine mask, bit = usage − 224) contains every kind
+    /// this mask requires; either side counts. FUNCTION never matches (no
+    /// page-7 usage). Exact-equality checks are the recognizer's job.
+    pub fn matches(&self, held: u8) -> bool {
+        let kinds = Self::from_held_mask(held).raw_value;
+        let required = self.raw_value & !Self::FUNCTION.raw_value;
+        kinds & required == required
+    }
+}
+
+impl Default for ShortcutModifiers {
+    /// Default shortcut: Super/GUI held (Clicky `command`).
+    fn default() -> Self {
+        Self::COMMAND
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawValue {
+    #[serde(rename = "rawValue", default)]
+    raw_value: u32,
+}
+
+impl Serialize for ShortcutModifiers {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        RawValue {
+            raw_value: self.raw_value,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShortcutModifiers {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = RawValue::deserialize(d)?;
+        Ok(Self {
+            raw_value: r.raw_value,
+        })
+    }
+}
+
+/// Toggle-shortcut: N taps of `usage` while `modifiers` are held, inside
+/// `interval` seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShortcutConfiguration {
     #[serde(default = "def_shortcut_usage")]
     pub usage: u32,
-    #[serde(default = "def_shortcut_modifiers")]
-    pub modifiers: u8,
+    pub modifiers: ShortcutModifiers,
     #[serde(default = "def_tap_count")]
     pub tap_count: u32,
     #[serde(default = "def_one_f64")]
@@ -360,7 +443,7 @@ impl Default for ShortcutConfiguration {
     fn default() -> Self {
         Self {
             usage: 14,
-            modifiers: 1 << 3,
+            modifiers: ShortcutModifiers::COMMAND,
             tap_count: 3,
             interval: 1.0,
         }
@@ -400,8 +483,9 @@ impl Default for GeneralSettings {
 pub struct Favorite {
     pub id: String,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sound: Option<SoundSettings>,
+    /// Sound snapshot for preset recall. Non-optional on the wire — Clicky's
+    /// decoder rejects a Favorite without `sound`.
+    pub sound: SoundSettings,
     pub key_overrides: HashMap<String, KeyOverride>,
 }
 
@@ -410,11 +494,12 @@ impl Default for Favorite {
         Self {
             id: String::new(),
             name: String::new(),
-            sound: None,
+            sound: SoundSettings::default(),
             key_overrides: HashMap::new(),
         }
     }
 }
+
 
 /// Clicky `AppConfiguration` v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -462,9 +547,7 @@ impl AppConfiguration {
         }
         self.favorites.truncate(MAX_FAVORITES);
         for f in &mut self.favorites {
-            if let Some(s) = &mut f.sound {
-                s.validate();
-            }
+            f.sound.validate();
             f.key_overrides.retain(|_, o| !o.is_empty());
             for o in f.key_overrides.values_mut() {
                 o.validate();
@@ -539,11 +622,13 @@ impl Store {
         &self.path
     }
 
-    /// Update the in-memory config and coalesce a write. The write lands on
-    /// `flush()`, or immediately once ≥250 ms have passed since the first
-    /// pending change — writes are always ≥250 ms apart.
+    /// Update the in-memory config (validated — Clicky's `save()` writes
+    /// `config.validated()`, and `self.cfg` mirrors what lands on disk) and
+    /// coalesce a write. The write lands on `flush()`, or immediately once
+    /// ≥250 ms have passed since the first pending change — writes are always
+    /// ≥250 ms apart.
     pub fn save_debounced(&mut self, cfg: &AppConfiguration) -> Result<(), Error> {
-        self.cfg = cfg.clone();
+        self.cfg = cfg.clone().validated();
         let since = self.pending_since.get_or_insert_with(Instant::now);
         if since.elapsed() >= DEBOUNCE {
             self.flush()?;
@@ -581,7 +666,10 @@ fn write_atomic(path: &Path, cfg: &AppConfiguration) -> Result<(), Error> {
         fs::create_dir_all(dir)?;
     }
     let tmp = suffixed(path, ".tmp");
+    // Re-validate at the boundary — on-disk must always be in-range.
     let json = cfg
+        .clone()
+        .validated()
         .to_json()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(&tmp, json)?;
@@ -736,8 +824,7 @@ mod tests {
             cfg.favorites.push(Favorite {
                 id: format!("f{i}"),
                 name: format!("fav{i}"),
-                sound: None,
-                key_overrides: HashMap::new(),
+                ..Default::default()
             });
         }
         let cfg = cfg.validated();
@@ -803,5 +890,63 @@ mod tests {
         std::thread::sleep(Duration::from_millis(260));
         store.save_debounced(&cfg).unwrap();
         assert!(p.exists(), "write lands once window elapsed");
+    }
+    #[test]
+    fn clicky_modifier_object_round_trips() {
+        // Clicky serializes KeyModifiers as {"rawValue": N}.
+        let p = cfg_path();
+        fs::write(
+            &p,
+            r#"{"general": {"shortcut": {"usage": 14, "modifiers": {"rawValue": 8}, "tapCount": 3, "interval": 1.0}}}"#,
+        )
+        .unwrap();
+        let store = Store::load(&p).unwrap();
+        assert_eq!(store.cfg.general.shortcut.modifiers.raw_value, 8);
+
+        // Round-trips back to the same wire shape.
+        let json = store.cfg.to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["general"]["shortcut"]["modifiers"],
+            serde_json::json!({ "rawValue": 8 })
+        );
+    }
+
+    #[test]
+    fn modifier_kind_collapses_left_right() {
+        // LCtrl (224) or RCtrl (228) → control bit 8; either matches.
+        assert_eq!(
+            ShortcutModifiers::from_held_mask(1 << 0).raw_value,
+            8
+        );
+        assert_eq!(
+            ShortcutModifiers::from_held_mask(1 << 4).raw_value,
+            8
+        );
+        // Default shortcut = Super/GUI; LGUI 227 → bit 3 held → rawValue 1.
+        let m = ShortcutModifiers::from_held_mask(1 << 3);
+        assert_eq!(m.raw_value, 1);
+        assert!(ShortcutModifiers::COMMAND.matches(1 << 3));
+        assert!(!ShortcutModifiers::COMMAND.matches(1 << 0));
+        // LShift (225) + RShift (229) same kind.
+        assert_eq!(ShortcutModifiers::from_held_mask(1 << 1 | 1 << 5).raw_value, 2);
+    }
+
+    #[test]
+    fn saved_output_is_always_validated() {
+        let p = cfg_path();
+        let mut store = Store::load(&p).unwrap();
+        let mut cfg = AppConfiguration::default();
+        cfg.sound.volume = 2.0;
+        cfg.visualizer.dismiss_delay = 99.0;
+        store.save_debounced(&cfg).unwrap();
+        store.flush().unwrap();
+
+        // In-memory copy mirrors on-disk.
+        assert_eq!(store.cfg.sound.volume, 1.0);
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["sound"]["volume"], 1.0);
+        assert_eq!(v["visualizer"]["dismissDelay"], 5.0);
     }
 }
