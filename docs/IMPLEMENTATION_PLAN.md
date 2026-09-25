@@ -31,5 +31,6 @@ System deps are not installed in the dev environment by default — run
 `tools/setup.sh --install` (dnf: webkit2gtk4.1-devel, gtk4-devel,
 gtk4-layer-shell-devel, libappindicator-gtk3-devel, librsvg2-devel,
 alsa-lib-devel, libudev-devel, openssl-devel, nodejs; plus pnpm and the
-udev rule). Until then, tauri/gtk4/udev deps stay commented out in
-`crates/*/Cargo.toml` and cpal builds with `default-features = false`.
+udev rule). Until then, tauri/gtk4 deps stay commented out in
+`crates/clicky`/`crates/clicky-overlay`, and cpal and udev stay commented
+out in `crates/clicky-core` until setup provides alsa-lib-devel/libudev-devel.

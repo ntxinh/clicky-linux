@@ -13,12 +13,12 @@ rtrb = "0.3"
 # cpal = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-symphonia = "0.5"
+symphonia = { version = "0.5", features = ["mp3"] }
 anyhow = "1"
 thiserror = "2"
 fastrand = "2"
 # libudev-devel missing until tools/setup.sh runs:
 # udev = "0.9"
-# nix::sys::epoll lives under the "poll" feature in nix 0.30
-nix = { version = "0.30", features = ["poll", "fs"] }
+# nix::sys::epoll is gated by the "event" feature (which implies "poll") in nix 0.30
+nix = { version = "0.30", features = ["event", "fs"] }
 directories = "6"
