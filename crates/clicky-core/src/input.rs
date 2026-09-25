@@ -35,6 +35,12 @@ pub struct HotDevice {
     pub dev: RawDevice,
 }
 
+impl AsRef<Path> for HotDevice {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// One input event for the engine. `Dropped` = kernel signaled SYN_DROPPED on
 /// that device (ring buffer overflow) — call `Normalizer::clear_held(device)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +58,14 @@ pub struct Enumerated {
 fn event_nodes() -> io::Result<Vec<PathBuf>> {
     let mut nodes = Vec::new();
     for entry in std::fs::read_dir(DEV_INPUT_DIR)? {
-        let path = entry?.path();
+        // A single bad entry must not abort the whole scan.
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(e) => {
+                eprintln!("clicky: skipping unreadable {DEV_INPUT_DIR} entry: {e}");
+                continue;
+            }
+        };
         if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -185,6 +198,46 @@ fn dispatch(idx: usize, ev: EvdevEvent, cb: &mut impl FnMut(InputEvent)) {
     }
 }
 
+/// Backoff for rescan retries when a rescan reports issues (e.g. EACCES on a
+/// just-added node before udev fixes perms). Bounded: persistent issues like
+/// pre-udev-rule EACCES must not churn rescans forever — after the budget is
+/// spent, only a new udev event re-arms it.
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+/// Merge a fresh enumeration into the live device set.
+///
+/// Returns `(rebuilt, dropped_old_indices)`. `dropped` is non-empty only when
+/// the keyboard path set actually changed — those old indices get
+/// `InputEvent::Dropped` so held-key state is cleared before renumbering.
+/// `force` (device died: EPOLLHUP/read error) rebuilds even if paths match —
+/// to swap in fresh fds — but still emits no `Dropped` when they do.
+/// An unchanged, non-forced rescan is a true no-op: same fds, no re-arm.
+fn merge_rescan<D: AsRef<Path>>(
+    devices: &mut Vec<D>,
+    scanned: Vec<D>,
+    force: bool,
+) -> (bool, Vec<u32>) {
+    let same_paths = devices.len() == scanned.len()
+        && devices
+            .iter()
+            .zip(scanned.iter())
+            .all(|(a, b)| a.as_ref() == b.as_ref());
+    if same_paths && !force {
+        return (false, Vec::new());
+    }
+    let dropped: Vec<u32> = if same_paths {
+        Vec::new()
+    } else {
+        (0..devices.len() as u32).collect()
+    };
+    *devices = scanned;
+    (true, dropped)
+}
+
 /// Run the read loop: epoll over the given keyboards plus a udev monitor.
 /// `cb` gets [`InputEvent`]s; `device` indexes the live set (re-enumerated on
 /// hotplug — `Dropped` is emitted for every old index before a rescan so the
@@ -205,8 +258,11 @@ pub fn run(
     let mut events = vec![EpollEvent::empty(); devices.len().max(1) + 1];
     // Last udev event seen; rescan when it's this old. None = no pending rescan.
     let mut changed_at: Option<Instant> = None;
-    // A rescan failed recently (e.g. EACCES on a just-added node); retry.
+    // Bounded rescan retries after issues (e.g. EACCES on a just-added node
+    // before udev fixes perms). Persistent issues — like every node EACCES
+    // pre-udev-rule — stop after RETRY_DELAYS until a new udev event.
     let mut retry_at: Option<Instant> = None;
+    let mut retries = 0usize;
 
     while !stop.load(Ordering::Relaxed) {
         let n = match epoll.wait(&mut events, EPOLL_POLL_MS) {
@@ -221,6 +277,7 @@ pub fn run(
             if data == UDEV_TAG {
                 if hotplug.as_ref().is_some_and(|h| h.drain_changed()) {
                     changed_at = Some(Instant::now());
+                    retries = 0; // new udev event = fresh retry budget
                 }
             } else if ev
                 .events()
@@ -232,29 +289,40 @@ pub fn run(
             }
         }
 
-        // Debounce: rescan 300 ms after the last udev event* change, or at the
-        // scheduled retry after a failed rescan.
+        // Debounce: rescan 300 ms after the last udev event* change, at the
+        // scheduled retry after a failed rescan, or now if a device died.
         let now = Instant::now();
         if dirty
             || changed_at.is_some_and(|t| now.duration_since(t) >= HOTPLUG_DEBOUNCE)
             || retry_at.is_some_and(|t| now >= t)
         {
-            // Clear held state on all old indices before renumbering.
-            for i in 0..devices.len() {
-                cb(InputEvent::Dropped {
-                    device: i as u32,
-                });
-            }
             let rescan = keyboard_devices();
+            let had_issues = !rescan.issues.is_empty();
             for issue in &rescan.issues {
                 // EACCES is expected until the udev rule is installed.
                 eprintln!("clicky: {}: {}", issue.path.display(), issue.error);
             }
-            devices = rescan.keyboards;
-            epoll = arm_epoll(&devices, hotplug.as_ref())?;
-            events = vec![EpollEvent::empty(); devices.len().max(1) + 1];
+            let (rebuilt, dropped) = merge_rescan(&mut devices, rescan.keyboards, dirty);
+            // Held state is cleared only when the device set actually changed —
+            // a rescan returning the same nodes must not orphan held keys.
+            for i in dropped {
+                cb(InputEvent::Dropped { device: i });
+            }
+            if rebuilt {
+                epoll = arm_epoll(&devices, hotplug.as_ref())?;
+                events = vec![EpollEvent::empty(); devices.len().max(1) + 1];
+            }
             changed_at = None;
-            retry_at = (!rescan.issues.is_empty()).then(|| Instant::now() + Duration::from_secs(1));
+            retry_at = if had_issues && retries < RETRY_DELAYS.len() {
+                let delay = RETRY_DELAYS[retries];
+                retries += 1;
+                Some(Instant::now() + delay)
+            } else {
+                None
+            };
+            if !had_issues {
+                retries = 0; // resolved — restore the budget
+            }
         }
     }
     Ok(())
@@ -264,6 +332,43 @@ pub fn run(
 mod tests {
     use super::*;
     use evdev::AttributeSet;
+
+    fn paths(ps: &[&str]) -> Vec<PathBuf> {
+        ps.iter().map(PathBuf::from).collect()
+    }
+
+    /// Review fix: a rescan that returns the same device set must be a no-op —
+    /// no rebuild, and no `Dropped` events that would wipe held-key state.
+    #[test]
+    fn rescan_unchanged_emits_no_dropped() {
+        let mut devices = paths(&["/dev/input/event3", "/dev/input/event7"]);
+        let (rebuilt, dropped) =
+            merge_rescan(&mut devices, paths(&["/dev/input/event3", "/dev/input/event7"]), false);
+        assert!(!rebuilt);
+        assert!(dropped.is_empty());
+        assert_eq!(devices, paths(&["/dev/input/event3", "/dev/input/event7"]));
+    }
+
+    #[test]
+    fn rescan_changed_drops_old_indices() {
+        let mut devices = paths(&["/dev/input/event3", "/dev/input/event7"]);
+        let (rebuilt, dropped) =
+            merge_rescan(&mut devices, paths(&["/dev/input/event3", "/dev/input/event9"]), false);
+        assert!(rebuilt);
+        assert_eq!(dropped, vec![0, 1]);
+        assert_eq!(devices, paths(&["/dev/input/event3", "/dev/input/event9"]));
+    }
+
+    /// Force (device died) rebuilds to swap in fresh fds but still emits no
+    /// `Dropped` when the path set is unchanged — held state survives a
+    /// same-node reopen.
+    #[test]
+    fn rescan_forced_same_paths_keeps_held_state() {
+        let mut devices = paths(&["/dev/input/event3"]);
+        let (rebuilt, dropped) = merge_rescan(&mut devices, paths(&["/dev/input/event3"]), true);
+        assert!(rebuilt);
+        assert!(dropped.is_empty());
+    }
 
     #[test]
     fn alphabet_predicate() {
