@@ -7,8 +7,6 @@
 //! evdev access and audio host/buffer info. `--input-probe` / `--audio-probe`
 //! re-exec the dev probes shipped next to this binary.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::process::exit;
 
 use clicky_core::audio::Audio;
@@ -55,34 +53,16 @@ fn usage_err(msg: &str) -> i32 {
     2
 }
 
-/// Send one command line to the running daemon; print the reply line.
+/// Send one command line to the running instance (daemon or UI); print the
+/// reply line.
 fn client(cmd: &str, rest: &[&String]) -> i32 {
-    let sock = daemon::socket_path();
-    let mut stream = match UnixStream::connect(&sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("clicky: can't reach daemon at {}: {e}", sock.display());
-            return 1;
-        }
-    };
     let mut line = cmd.to_string();
     for a in rest {
         line.push(' ');
         line.push_str(a);
     }
-    line.push('\n');
-    if let Err(e) = stream.write_all(line.as_bytes()) {
-        eprintln!("clicky: send: {e}");
-        return 1;
-    }
-    let mut reply = String::new();
-    match BufReader::new(&stream).read_line(&mut reply) {
-        Ok(0) => {
-            eprintln!("clicky: daemon closed without reply");
-            1
-        }
-        Ok(_) => {
-            let reply = reply.trim_end();
+    match daemon::send(&line) {
+        Ok(reply) => {
             println!("{reply}");
             if reply.starts_with("err") {
                 1
@@ -91,7 +71,7 @@ fn client(cmd: &str, rest: &[&String]) -> i32 {
             }
         }
         Err(e) => {
-            eprintln!("clicky: reply: {e}");
+            eprintln!("clicky: {e}");
             1
         }
     }

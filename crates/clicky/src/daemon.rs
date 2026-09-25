@@ -170,6 +170,58 @@ pub fn shutdown(boot: &mut Boot) {
     }
 }
 
+/// Create the socket dir (locked down 0700) and bind `control.sock`.
+/// A connectable socket means a live instance owns it → `Err("busy")`, no
+/// cleanup — callers must not remove a live peer's socket. `Err` strings are
+/// human-readable; the caller prints and exits.
+pub fn bind_socket() -> Result<UnixListener, String> {
+    let sock_dir = socket_dir();
+    std::fs::create_dir_all(&sock_dir).map_err(|e| format!("{}: {e}", sock_dir.display()))?;
+    // The /tmp fallback dir would land at umask-0755 — lock it down so no
+    // other user can pre-bind the socket, and refuse a foreign-owned dir.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(&sock_dir).map_err(|e| format!("{}: {e}", sock_dir.display()))?;
+    if meta.uid() != unsafe { libc::getuid() } {
+        return Err(format!("{} not owned by us", sock_dir.display()));
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&sock_dir, perms)
+        .map_err(|e| format!("{}: {e}", sock_dir.display()))?;
+    let sock = socket_path();
+    if UnixStream::connect(&sock).is_ok() {
+        return Err(format!("busy: another instance owns {}", sock.display()));
+    }
+    // Stale socket file — safe to reclaim.
+    let _ = std::fs::remove_file(&sock);
+    let listener =
+        UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("socket nonblocking: {e}"))?;
+    eprintln!("clicky: control socket on {}", sock.display());
+    Ok(listener)
+}
+
+/// Send one command line to the instance owning the control socket; returns
+/// the reply line.
+pub fn send(line: &str) -> Result<String, String> {
+    let sock = socket_path();
+    let mut stream = UnixStream::connect(&sock)
+        .map_err(|e| format!("can't reach daemon at {}: {e}", sock.display()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(|e| format!("send: {e}"))?;
+    let mut reply = String::new();
+    match BufReader::new(&stream).read_line(&mut reply) {
+        Ok(0) => Err("closed without reply".into()),
+        Ok(_) => Ok(reply.trim_end().to_string()),
+        Err(e) => Err(format!("reply: {e}")),
+    }
+}
+
 /// Run the daemon in the foreground until `quit`, SIGTERM or SIGINT.
 /// Returns the process exit code.
 pub fn run() -> i32 {
@@ -182,52 +234,16 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-
-    // Control socket: stale socket file gets reclaimed; a live one means a
-    // second daemon — exit rather than double-consume evdev.
-    let sock_dir = socket_dir();
-    if let Err(e) = std::fs::create_dir_all(&sock_dir) {
-        eprintln!("clicky: {}: {e}", sock_dir.display());
-        return 1;
-    }
-    // The /tmp fallback dir would land at umask-0755 — lock it down so no
-    // other user can pre-bind the socket, and refuse a foreign-owned dir.
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = match std::fs::metadata(&sock_dir) {
-        Ok(m) if m.uid() == unsafe { libc::getuid() } => m,
-        Ok(_) => {
-            eprintln!("clicky: {} not owned by us", sock_dir.display());
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("clicky: {}: {e}", sock_dir.display());
-            return 1;
-        }
-    };
-    let mut perms = meta.permissions();
-    perms.set_mode(0o700);
-    if let Err(e) = std::fs::set_permissions(&sock_dir, perms) {
-        eprintln!("clicky: {}: {e}", sock_dir.display());
-        return 1;
-    }
-    let sock = socket_path();
-    if UnixStream::connect(&sock).is_ok() {
-        eprintln!("clicky: another daemon owns {}", sock.display());
-        return 1;
-    }
-    let _ = std::fs::remove_file(&sock);
-    let listener = match UnixListener::bind(&sock) {
+    // Control socket — a connectable socket means a second instance: exit
+    // rather than double-consume evdev.
+    let listener = match bind_socket() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("clicky: bind {}: {e}", sock.display());
+            eprintln!("clicky: {e}");
+            shutdown(&mut b);
             return 1;
         }
     };
-    if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("clicky: socket nonblocking: {e}");
-        return 1;
-    }
-    eprintln!("clicky: control socket on {}", sock.display());
 
     while !b.quit.load(Ordering::Relaxed) && !SIG_QUIT.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -250,7 +266,7 @@ pub fn run() -> i32 {
     }
 
     shutdown(&mut b);
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(socket_path());
     eprintln!("clicky: quit");
     0
 }
@@ -288,6 +304,22 @@ fn spawn_input(
     })
 }
 
+/// Snapshot of the audio side `status` needs — callers gather it before
+/// locking `shared` so a UI-side `Mutex<Audio>` never nests audio→shared.
+pub struct AudioStatus {
+    pub device_name: String,
+    pub stats: clicky_core::mixer::Stats,
+}
+
+impl AudioStatus {
+    pub fn of(audio: &Audio) -> Self {
+        Self {
+            device_name: audio.device_name().to_string(),
+            stats: audio.stats(),
+        }
+    }
+}
+
 /// One connection = one command line = one reply line.
 fn handle(
     mut stream: UnixStream,
@@ -308,24 +340,36 @@ fn handle(
     let reply = match read {
         Err(_) => "err read".to_string(),
         Ok(0) => "err empty".to_string(),
-        Ok(_) => command(line.trim(), shared, controls, audio, quit, capture_alive),
+        Ok(_) => command(
+            line.trim(),
+            shared,
+            controls,
+            &AudioStatus::of(audio),
+            quit,
+            capture_alive,
+        ),
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.write_all(b"\n");
 }
 
-/// Dispatch one command; returns the reply line (no newline).
-fn command(
+/// Dispatch one command; returns the reply line (no newline). Crate-public:
+/// `ipc.rs`'s socket thread routes CLI verbs (enable/disable/profile/status)
+/// here so the same control surface works against the UI instance.
+pub(crate) fn command(
     line: &str,
     shared: &Arc<Mutex<Shared>>,
     controls: &MixerControls,
-    audio: &Audio,
+    audio: &AudioStatus,
     quit: &Arc<AtomicBool>,
     capture_alive: &Arc<AtomicBool>,
 ) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("status"), None, None) => status_line(shared, audio, capture_alive),
+        // UI-mode only; the daemon is headless — still counts as a live
+        // instance so the caller exits instead of double-booting.
+        (Some("show"), None, None) => "err daemon mode".to_string(),
         (Some("quit"), None, None) => {
             quit.store(true, Ordering::Relaxed);
             "ok".into()
@@ -351,12 +395,7 @@ fn command(
         }
         (Some("profile"), Some(id), None) => {
             let mut sh = shared.lock();
-            if !sh
-                .engine
-                .profiles()
-                .iter()
-                .any(|p| p.id == *id)
-            {
+            if !sh.engine.profiles().iter().any(|p| p.id == *id) {
                 return format!("err unknown profile {id}");
             }
             let mut cfg = sh.store.cfg.clone();
@@ -376,17 +415,20 @@ fn command(
 }
 
 /// `status` reply: one JSON line.
-fn status_line(shared: &Arc<Mutex<Shared>>, audio: &Audio, alive: &Arc<AtomicBool>) -> String {
+fn status_line(
+    shared: &Arc<Mutex<Shared>>,
+    audio: &AudioStatus,
+    alive: &Arc<AtomicBool>,
+) -> String {
     // Enumerate readable nodes for counts; the reader's own liveness flag
     // decides "live" vs "dead" so a crashed loop never lies.
     let scan = input::keyboard_devices();
     let alive = alive.load(Ordering::Relaxed);
-    let stats = audio.stats();
     let sh = shared.lock();
     serde_json::json!({
         "enabled": sh.store.cfg.enabled,
         "profile": sh.engine.profile_id(),
-        "audio_device": audio.device_name(),
+        "audio_device": audio.device_name,
         "capture": if !alive {
             "dead"
         } else if !scan.keyboards.is_empty() {
@@ -398,9 +440,9 @@ fn status_line(shared: &Arc<Mutex<Shared>>, audio: &Audio, alive: &Arc<AtomicBoo
         },
         "keyboards": scan.keyboards.len(),
         "issues": scan.issues.len(),
-        "accepted": stats.accepted,
-        "dropped": stats.dropped,
-        "stolen": stats.stolen,
+        "accepted": audio.stats.accepted,
+        "dropped": audio.stats.dropped,
+        "stolen": audio.stats.stolen,
     })
     .to_string()
 }

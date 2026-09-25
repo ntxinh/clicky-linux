@@ -4,15 +4,21 @@
 //! engine, mixer and store so an `Err` genuinely means nothing changed.
 //!
 //! No tray: libayatana-appindicator isn't available in the build sysroot, so
-//! the window opens on launch and close→hide keeps the app alive. `Quit`
-//! lives on the Home page (and `clicky quit` still works when --daemon owns
-//! the engine — in UI mode there is no control socket).
+//! the window opens on launch and close→hide keeps the app alive. The UI
+//! instance binds the same control socket as `--daemon` — that's the
+//! single-instance guard: a second `clicky` connects, sends `show` and exits
+//! instead of spawning a second engine. CLI verbs (enable/disable/profile/
+//! status) work against a running UI instance too.
+//!
+//! Lock order: `shared` before `audio`, or each alone — never audio→shared.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
-use clicky_core::audio::Audio;
+use clicky_core::audio::{Audio, MixerControls};
 use clicky_core::config::{AppConfiguration, KeyOverride, ModifierSoundMode};
 use clicky_core::import;
 use clicky_core::input;
@@ -27,9 +33,12 @@ use crate::daemon::{self, Shared};
 /// `set_device` needs `&mut Audio` while `shared` stays lockable.
 pub struct AppState {
     pub shared: Arc<Mutex<Shared>>,
-    pub audio: Mutex<Audio>,
-    /// Loaded-profile ids is implicit in `engine.profiles()`; sounds dir is
-    /// where imported packs land (`<dir>/user/`).
+    /// `Mutex` guard order: shared → audio (see module doc). `Arc` so the
+    /// control-socket thread can snapshot `AudioStatus`.
+    pub audio: Arc<Mutex<Audio>>,
+    /// Mixer gain/enable handle for the socket thread's enable/disable.
+    pub controls: MixerControls,
+    /// Where `profiles.json` was found; packs import into `<dir>/user/`.
     pub sounds_dir: PathBuf,
     pub quit: Arc<AtomicBool>,
     pub capture_alive: Arc<AtomicBool>,
@@ -272,13 +281,15 @@ fn list_devices() -> Vec<clicky_core::audio::DeviceInfo> {
 fn set_output_device(app: AppHandle, state: State<AppState>, name: String) -> CmdResult<()> {
     state.audio.lock().set_device(&name).map_err(map_err)?;
     let mut sh = state.shared.lock();
-    let mut cfg = sh.store.cfg.clone();
+    let prev = sh.store.cfg.clone();
+    let mut cfg = prev.clone();
     cfg.sound.output_device_uid = Some(name);
-    // Device already switched; a persist failure only means the choice won't
-    // survive restart — revert the uid, not the stream (repick can't undo).
-    sh.store
-        .save_debounced(&cfg)
-        .map_err(map_err)?;
+    sh.engine.update_config(cfg.clone());
+    if let Err(e) = sh.store.save_debounced(&cfg) {
+        sh.store.cfg = prev.clone();
+        sh.engine.update_config(prev);
+        return Err(map_err(e));
+    }
     emit_config(&app, &cfg);
     Ok(())
 }
@@ -342,9 +353,10 @@ fn import_pack(app: AppHandle, state: State<AppState>, path: String) -> CmdResul
 fn get_diagnostics(state: State<AppState>) -> serde_json::Value {
     let scan = input::keyboard_devices();
     let alive = state.capture_alive.load(std::sync::atomic::Ordering::Relaxed);
+    // Lock order shared → audio (module doc); both guards die at return.
+    let sh = state.shared.lock();
     let audio = state.audio.lock();
     let stats = audio.stats();
-    let sh = state.shared.lock();
     serde_json::json!({
         "enabled": sh.store.cfg.enabled,
         "profile": sh.engine.profile_id(),
@@ -413,6 +425,8 @@ fn apply_modifier_preset(app: AppHandle, state: State<AppState>, slot: usize) ->
     let prev = sh.store.cfg.clone();
     let mut cfg = prev.clone();
     cfg.sound = fav.sound;
+    // A sound preset must not move audio output: keep the live device uid.
+    cfg.sound.output_device_uid = prev.sound.output_device_uid.clone();
     cfg.key_overrides = fav.key_overrides;
     sh.engine.update_config(cfg.clone());
     state.audio.lock().set_enabled(cfg.enabled);
@@ -431,11 +445,32 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-/// Bare `clicky`: boot the engine in-process, then run the Tauri event loop.
-/// Degrades when boot pieces are missing: audio failure still opens the UI
-/// (settings persist, preview is silent) via a stub — no, keep it simple:
-/// boot failure exits with the error, matching the daemon.
+/// Bare `clicky`: single-instance via the control socket — a connectable
+/// socket means a clicky is already running, so ask it to `show` and exit
+/// instead of booting a second engine (double Audio stream + double evdev
+/// reader + two writers to config.json). Otherwise boot in-process, bind the
+/// socket and run the Tauri event loop.
 pub fn run_app() -> i32 {
+    // Single-instance probe BEFORE boot — a second launch must not even
+    // start an audio stream or evdev reader.
+    match daemon::send("show") {
+        Ok(reply) => {
+            if reply.starts_with("err") {
+                // Live daemon owns the socket: can't show a window, but the
+                // instance exists — don't double-boot.
+                eprintln!("clicky: daemon already running ({reply})");
+            }
+            return 0;
+        }
+        Err(e) => {
+            // "can't reach" → no live instance; other errors are real.
+            if !e.starts_with("can't reach") {
+                eprintln!("clicky: {e}");
+                return 1;
+            }
+        }
+    }
+
     let b = match daemon::boot() {
         Ok(b) => b,
         Err(e) => {
@@ -446,7 +481,7 @@ pub fn run_app() -> i32 {
     let daemon::Boot {
         shared,
         audio,
-        controls: _,
+        controls,
         sounds_dir,
         quit,
         capture_alive,
@@ -454,16 +489,111 @@ pub fn run_app() -> i32 {
     } = b;
     let state = AppState {
         shared,
-        audio: Mutex::new(audio),
+        audio: Arc::new(Mutex::new(audio)),
+        controls,
         sounds_dir,
         quit,
         capture_alive,
         input: Mutex::new(input),
     };
-    run_app_with(state)
+
+    // Single-instance socket: a lost bind race still exits without two
+    // engines; the accept thread starts once the AppHandle exists (.setup).
+    match daemon::bind_socket() {
+        Ok(listener) => run_app_with(state, listener),
+        Err(e) => {
+            eprintln!("clicky: {e}");
+            return 1;
+        }
+    }
 }
 
-fn run_app_with(state: AppState) -> i32 {
+/// Accept loop for the UI instance's control socket. One connection = one
+/// line = one reply — same wire protocol as the daemon. `show`/`quit` are
+/// UI-only; CLI verbs delegate to `daemon::command` so `clicky enable` etc.
+/// work against a running app instance.
+fn spawn_socket(listener: std::os::unix::net::UnixListener, app: AppHandle) {
+    let state = app.state::<AppState>();
+    let shared = state.shared.clone();
+    let controls = state.controls.clone();
+    let audio = state.audio.clone();
+    let quit = state.quit.clone();
+    let alive = state.capture_alive.clone();
+    std::thread::spawn(move || loop {
+        let (mut stream, _) = match listener.accept() {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("clicky: accept: {e}");
+                return;
+            }
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut line = String::new();
+        let read = stream
+            .try_clone()
+            .and_then(|s| BufReader::new(s).read_line(&mut line));
+        let reply = match read {
+            Err(_) => "err read".to_string(),
+            Ok(0) => "err empty".to_string(),
+            Ok(_) => ui_command(
+                line.trim(),
+                &app,
+                &shared,
+                &controls,
+                &audio,
+                &quit,
+                &alive,
+            ),
+        };
+        let _ = stream.write_all(reply.as_bytes());
+        let _ = stream.write_all(b"\n");
+    });
+}
+
+/// Socket dispatcher for the UI instance. `show`/`quit` need the AppHandle;
+/// everything else goes through the daemon's verb table (status collects its
+/// audio snapshot before locking `shared` — never audio→shared).
+fn ui_command(
+    line: &str,
+    app: &AppHandle,
+    shared: &Arc<Mutex<Shared>>,
+    controls: &MixerControls,
+    audio: &Arc<Mutex<Audio>>,
+    quit: &Arc<AtomicBool>,
+    alive: &Arc<AtomicBool>,
+) -> String {
+    let mut words = line.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some("show"), None, None) => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+            "ok".into()
+        }
+        (Some("quit"), None, None) => {
+            app.exit(0);
+            "ok".into()
+        }
+        _ => {
+            let status = daemon::AudioStatus::of(&audio.lock());
+            let reply = daemon::command(line, shared, controls, &status, quit, alive);
+            // A verb that changed config → refresh the UI like an IPC mutation.
+            if reply == "ok" {
+                emit_config(app, &shared.lock().store.cfg.clone());
+            }
+            reply
+        }
+    }
+}
+
+fn run_app_with(state: AppState, listener: std::os::unix::net::UnixListener) -> i32 {
     let quit = state.quit.clone();
     let app = tauri::Builder::default()
         .manage(state)
@@ -492,9 +622,13 @@ fn run_app_with(state: AppState) -> i32 {
             apply_modifier_preset,
             quit_app,
         ])
+        .setup(move |app| {
+            spawn_socket(listener, app.handle().clone());
+            Ok(())
+        })
         .on_window_event(|window, event| {
             // No tray → the window is the only handle on the app; close hides
-            // rather than exits (quit via Home or SIGTERM).
+            // rather than exits (quit via Home, `clicky quit`, or SIGTERM).
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -513,6 +647,7 @@ fn run_app_with(state: AppState) -> i32 {
                     if let Err(e) = state.shared.lock().store.flush() {
                         eprintln!("clicky: config save: {e}");
                     };
+                    let _ = std::fs::remove_file(daemon::socket_path());
                 }
             });
             0
