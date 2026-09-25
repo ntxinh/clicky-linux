@@ -9,7 +9,9 @@
 //! enabled codecs cover), mixed down to mono f32, and registered into the
 //! [`Mixer`] at its source rate (the mixer resamples per-voice). Samples over
 //! [`MAX_SECS`] are rejected. A bad profile is collected into
-//! [`LoadReport::errors`] and excluded — it never fails the whole load.
+//! [`LoadReport::errors`] and excluded — it never fails the whole load, and
+//! its samples are never registered (two-phase load: decode all, then
+//! register all — no orphaned registry slots).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -105,8 +107,9 @@ struct RawProfile {
     color: String,
     samples: Vec<String>,
     release_samples: Option<Vec<String>>,
+    /// Nullable in the wild — missing or null both mean "no overrides".
     #[serde(default)]
-    key_samples: HashMap<String, RawKeySamples>,
+    key_samples: Option<HashMap<String, RawKeySamples>>,
     #[serde(default = "def_gain")]
     gain: f32,
     provenance: Option<serde_json::Value>,
@@ -140,9 +143,10 @@ pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error>
         let raw: RawProfile = match serde_json::from_value(entry) {
             Ok(r) => r,
             Err(e) => {
+                // Name manifest + entry id distinctly: logs stay greppable.
                 report
                     .errors
-                    .push((id, Error::Parse(path.join("<entry>"), e)));
+                    .push((id.clone(), Error::Parse(path.join(format!("entry[{id}]")), e)));
                 continue;
             }
         };
@@ -154,26 +158,45 @@ pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error>
     Ok(report)
 }
 
-/// Resolve one profile: validate + decode + register every sample.
+/// Decoded-but-unregistered sample: `(resolved path, mono pcm, src_rate)`.
+type Staged = Vec<(PathBuf, Arc<[f32]>, u32)>;
+
+/// Resolve one profile in two phases: decode + validate every file first
+/// (nothing touches the mixer), then register only if all decode — a failed
+/// profile leaves zero orphaned slots in the registry.
 fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profile, Error> {
-    let presses = load_list(dir, &raw.samples, mixer)?;
+    // Phase 1: decode all.
+    let presses = stage_list(dir, &raw.samples)?;
     let releases = match &raw.release_samples {
-        Some(paths) => load_list(dir, paths, mixer)?,
+        Some(paths) => stage_list(dir, paths)?,
         None => Vec::new(),
     };
-    let mut keys = HashMap::with_capacity(raw.key_samples.len());
-    for (keyid, ks) in raw.key_samples {
-        keys.insert(
+    let mut keys = Vec::with_capacity(raw.key_samples.as_ref().map_or(0, HashMap::len));
+    for (keyid, ks) in raw.key_samples.unwrap_or_default() {
+        keys.push((
             keyid,
-            KeySamples {
-                presses: load_list(dir, &ks.samples, mixer)?,
-                releases: match &ks.release_samples {
-                    Some(paths) => load_list(dir, paths, mixer)?,
-                    None => Vec::new(),
-                },
+            stage_list(dir, &ks.samples)?,
+            match &ks.release_samples {
+                Some(paths) => stage_list(dir, paths)?,
+                None => Vec::new(),
             },
-        );
+        ));
     }
+    // Phase 2: all decoded — register.
+    let presses = register_list(presses, mixer)?;
+    let releases = register_list(releases, mixer)?;
+    let keys = keys
+        .into_iter()
+        .map(|(keyid, p, r)| {
+            Ok((
+                keyid,
+                KeySamples {
+                    presses: register_list(p, mixer)?,
+                    releases: register_list(r, mixer)?,
+                },
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, Error>>()?;
     Ok(Profile {
         id: raw.id,
         name: raw.name,
@@ -189,17 +212,26 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
     })
 }
 
-/// Decode + register a list of sample paths; any failure aborts the profile.
-fn load_list(dir: &Path, paths: &[String], mixer: &mut Mixer) -> Result<Vec<u16>, Error> {
+/// Resolve + decode a list of sample paths; any failure aborts the profile
+/// before anything is registered.
+fn stage_list(dir: &Path, paths: &[String]) -> Result<Staged, Error> {
     paths
         .iter()
         .map(|rel| {
             let path = resolve(dir, rel);
             let (pcm, rate) = decode(&path)?;
-            match mixer.register(pcm, rate) {
-                u16::MAX => Err(Error::Registry(path)),
-                id => Ok(id),
-            }
+            Ok((path, pcm, rate))
+        })
+        .collect()
+}
+
+/// Register staged PCM into the mixer.
+fn register_list(staged: Staged, mixer: &mut Mixer) -> Result<Vec<u16>, Error> {
+    staged
+        .into_iter()
+        .map(|(path, pcm, rate)| match mixer.register(pcm, rate) {
+            u16::MAX => Err(Error::Registry(path)),
+            id => Ok(id),
         })
         .collect()
 }
@@ -247,6 +279,16 @@ fn decode(path: &Path) -> Result<(Arc<[f32]>, u32), Error> {
         .default_track()
         .ok_or_else(|| Error::NoTrack(path.to_path_buf()))?;
     let track_id = track.id;
+    // Cheap pre-check: reject over-length files from the declared duration
+    // before burning decode CPU/RAM. The post-decode frame count below stays
+    // the authoritative guard for formats that lie.
+    if let (Some(n), Some(tb)) = (track.codec_params.n_frames, track.codec_params.time_base) {
+        let t = tb.calc_time(n);
+        let secs = t.seconds as f64 + t.frac;
+        if secs > MAX_SECS {
+            return Err(Error::TooLong(path.to_path_buf(), secs));
+        }
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| Error::Decode(path.to_path_buf(), e))?;
@@ -334,6 +376,13 @@ mod tests {
         write_wav(&dir.join(name), 48000, 1, &vec![1000i16; n]);
     }
 
+    /// Registry watermark: id the next registered sample would get.
+    fn registry_len(mixer: &mut Mixer) -> u16 {
+        let id = mixer.register(Arc::from(vec![0.0f32; 8].into_boxed_slice()), 48000);
+        assert_ne!(id, u16::MAX);
+        id // ids are sequential → this equals count before this register
+    }
+
     #[test]
     fn parses_manifest_and_registers_samples() {
         let d = TestDir::new("full");
@@ -394,7 +443,7 @@ mod tests {
         std::fs::write(
             d.0.join("profiles.json"),
             r#"[{"id":"t","name":"T","subtitle":"s","color":"FFF",
-                "samples":["x.wav"],"releaseSamples":null}]"#,
+                "samples":["x.wav"],"releaseSamples":null,"keySamples":null}]"#,
         )
         .unwrap();
         let mut mixer = Mixer::new(48000);
@@ -432,6 +481,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_profile_leaves_no_registry_orphans() {
+        let d = TestDir::new("orphans");
+        // 3-sample profile whose 3rd file is missing — first two must not
+        // leak into the registry.
+        wav(&d.0, "a.wav", 480);
+        wav(&d.0, "b.wav", 480);
+        std::fs::write(
+            d.0.join("profiles.json"),
+            r#"[
+                {"id":"good","name":"G","subtitle":"s","color":"F","samples":["a.wav"]},
+                {"id":"leaky","name":"L","subtitle":"s","color":"F",
+                 "samples":["a.wav","b.wav","gone.wav"]}
+            ]"#,
+        )
+        .unwrap();
+        let mut mixer = Mixer::new(48000);
+        let report = load_manifest(&d.0, &mut mixer).unwrap();
+        assert_eq!(report.profiles.len(), 1);
+        assert_eq!(report.errors.len(), 1);
+        // Only "good"'s one sample registered → next id is 1, not 3.
+        assert_eq!(registry_len(&mut mixer), 1);
+    }
+
+    #[test]
     fn over_15s_rejected() {
         let d = TestDir::new("long");
         write_wav(&d.0.join("long.wav"), 8000, 1, &vec![1000i16; 16 * 8000]); // 16s @ 8kHz
@@ -451,7 +524,7 @@ mod tests {
     #[test]
     fn stereo_is_mixed_down() {
         let d = TestDir::new("stereo");
-        // L=+0.5, L=-0.5 → mono 0.0; check via decode() directly.
+        // L=+0.5, R=-0.5 → mono 0.0; check via decode() directly.
         write_wav(&d.0.join("st.wav"), 48000, 2, &[16384, -16384, 16384, -16384]);
         let (pcm, rate) = decode(&d.0.join("st.wav")).unwrap();
         assert_eq!(rate, 48000);
@@ -476,5 +549,10 @@ mod tests {
         assert_eq!(report.profiles.len(), 1);
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].0, "broken");
+        // Error path names manifest + entry id for greppable logs.
+        assert!(report.errors[0]
+            .1
+            .to_string()
+            .contains("entry[broken]"));
     }
 }
