@@ -9,6 +9,9 @@ license.workspace = true
 clicky-core = { path = "../clicky-core" }
 cpal = "0.15"
 parking_lot = "0.12"
+serde_json = "1"
+directories = "6"
+libc = "0.2"
 # Needs system libs — uncomment after tools/setup.sh:
 # tauri = { version = "2", features = ["tray-icon"] }
 

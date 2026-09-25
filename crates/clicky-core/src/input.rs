@@ -199,9 +199,9 @@ fn dispatch(idx: usize, ev: EvdevEvent, cb: &mut impl FnMut(InputEvent)) {
 }
 
 /// Backoff for rescan retries when a rescan reports issues (e.g. EACCES on a
-/// just-added node before udev fixes perms). Bounded: persistent issues like
-/// pre-udev-rule EACCES must not churn rescans forever — after the budget is
-/// spent, only a new udev event re-arms it.
+/// just-added node before udev fixes perms). Once the ladder runs out the
+/// poll continues at the last delay — a permission fix on already-enumerated
+/// nodes emits no udev event, so a fully-spent budget can't be the end.
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(5),
@@ -256,13 +256,18 @@ pub fn run(
     };
     let mut epoll = arm_epoll(&devices, hotplug.as_ref())?;
     let mut events = vec![EpollEvent::empty(); devices.len().max(1) + 1];
-    // Last udev event seen; rescan when it's this old. None = no pending rescan.
-    let mut changed_at: Option<Instant> = None;
-    // Bounded rescan retries after issues (e.g. EACCES on a just-added node
-    // before udev fixes perms). Persistent issues — like every node EACCES
-    // pre-udev-rule — stop after RETRY_DELAYS until a new udev event.
+    // Last udev event seen; rescan when it's this old. Seeded `now` so the
+    // loop always runs an initial rescan after the debounce — the caller's
+    // startup enumeration may already be stale (e.g. nodes appeared between
+    // enumerate and open, or perms just changed without a udev event).
+    let mut changed_at: Option<Instant> = Some(Instant::now());
+    // Bounded-then-slow rescan retries after issues (e.g. EACCES on a
+    // just-added node before udev fixes perms). Persistent issues — like
+    // every node EACCES pre-udev-rule — drop to the last delay forever.
     let mut retry_at: Option<Instant> = None;
     let mut retries = 0usize;
+    // Last issue signature logged, for dedup during sustained polling.
+    let mut last_issues = String::new();
 
     while !stop.load(Ordering::Relaxed) {
         let n = match epoll.wait(&mut events, EPOLL_POLL_MS) {
@@ -298,9 +303,18 @@ pub fn run(
         {
             let rescan = keyboard_devices();
             let had_issues = !rescan.issues.is_empty();
-            for issue in &rescan.issues {
+            let report = rescan
+                .issues
+                .iter()
+                .map(|i| format!("{}: {}", i.path.display(), i.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if report != last_issues {
                 // EACCES is expected until the udev rule is installed.
-                eprintln!("clicky: {}: {}", issue.path.display(), issue.error);
+                for line in report.split("; ").filter(|s| !s.is_empty()) {
+                    eprintln!("clicky: {line}");
+                }
+                last_issues = report;
             }
             let (rebuilt, dropped) = merge_rescan(&mut devices, rescan.keyboards, dirty);
             // Held state is cleared only when the device set actually changed —
@@ -313,16 +327,13 @@ pub fn run(
                 events = vec![EpollEvent::empty(); devices.len().max(1) + 1];
             }
             changed_at = None;
-            retry_at = if had_issues && retries < RETRY_DELAYS.len() {
-                let delay = RETRY_DELAYS[retries];
-                retries += 1;
-                Some(Instant::now() + delay)
+            retry_at = if had_issues {
+                retries = retries.saturating_add(1);
+                Some(Instant::now() + RETRY_DELAYS[(retries - 1).min(RETRY_DELAYS.len() - 1)])
             } else {
+                retries = 0;
                 None
             };
-            if !had_issues {
-                retries = 0; // resolved — restore the budget
-            }
         }
     }
     Ok(())

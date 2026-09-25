@@ -222,6 +222,15 @@ impl Engine {
         self.last_variant.clear();
     }
 
+    /// Id of the active profile (resolved, never stale like a config copy).
+    pub fn profile_id(&self) -> &str {
+        self.profiles
+            .get(self.active)
+            .map(|p| p.id.as_str())
+            .unwrap_or("")
+    }
+
+
     /// Apply a new configuration. Re-derives normalization when the toggle
     /// changed, re-resolves the active profile when `profile_id` changed, and
     /// drops release intents when the engine goes disabled (muted press must

@@ -167,7 +167,10 @@ version = "0.1.0"
 dependencies = [
  "clicky-core",
  "cpal",
+ "directories",
+ "libc",
  "parking_lot",
+ "serde_json",
 ]
 
 [[package]]
