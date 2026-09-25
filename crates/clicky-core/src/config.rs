@@ -46,6 +46,9 @@ fn def_spatial_width() -> f32 {
 fn def_home_row_softness() -> f32 {
     0.15
 }
+fn def_one() -> f32 {
+    1.0
+}
 fn def_mouse_volume() -> f32 {
     0.25
 }
@@ -155,6 +158,12 @@ pub struct SoundSettings {
     #[serde(default = "def_home_row_softness")]
     pub home_row_softness: f32,
     pub modifier_sound_mode: ModifierSoundMode,
+    /// `modifierSoundMode = "custom"` gain 0..=1 (default 1.0).
+    #[serde(default = "def_one")]
+    pub modifier_custom_volume: f32,
+    /// `modifierSoundMode = "custom"` pitch −1..=1 (default 0).
+    #[serde(default)]
+    pub modifier_custom_pitch: f32,
     #[serde(rename = "outputDeviceUID", skip_serializing_if = "Option::is_none")]
     pub output_device_uid: Option<String>,
     #[serde(default = "def_mouse_sound")]
@@ -191,6 +200,8 @@ impl Default for SoundSettings {
             mouse_volume: 0.25,
             enter_sound: ExtraSound::None,
             enter_volume: 0.4,
+            modifier_custom_volume: 1.0,
+            modifier_custom_pitch: 0.0,
             custom_mouse: None,
             custom_enter: None,
         }
@@ -204,6 +215,8 @@ impl SoundSettings {
         self.pitch = clamp(self.pitch, -1.0, 1.0);
         self.spatial_width = clamp(self.spatial_width, 0.0, 1.0);
         self.home_row_softness = clamp(self.home_row_softness, 0.0, 1.0);
+        self.modifier_custom_volume = clamp(self.modifier_custom_volume, 0.0, 1.0);
+        self.modifier_custom_pitch = clamp(self.modifier_custom_pitch, -1.0, 1.0);
         self.mouse_volume = clamp(self.mouse_volume, 0.0, 1.0);
         self.enter_volume = clamp(self.enter_volume, 0.0, 1.0);
     }

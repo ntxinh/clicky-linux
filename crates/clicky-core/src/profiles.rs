@@ -53,7 +53,8 @@ pub enum Error {
 }
 
 /// A loaded sound profile. `presses`/`releases`/`keys` hold mixer sample ids
-/// (see [`Mixer::register`]), not file paths.
+/// (see [`Mixer::register`]), not file paths. `levels` carries per-sample
+/// rms/peak measured at load for the engine's normalization table.
 #[derive(Debug)]
 pub struct Profile {
     pub id: String,
@@ -69,6 +70,9 @@ pub struct Profile {
     pub releases: Vec<u16>,
     /// Per-key overrides keyed by the HID keyid string verbatim ("7:44").
     pub keys: HashMap<String, KeySamples>,
+    /// Per-sample rms/peak measured at decode, keyed by mixer sample id —
+    /// feeds the engine's normalization table.
+    pub levels: HashMap<u16, Level>,
     /// Optional provenance block, passed through untouched.
     pub provenance: Option<serde_json::Value>,
 }
@@ -78,6 +82,13 @@ pub struct Profile {
 pub struct KeySamples {
     pub presses: Vec<u16>,
     pub releases: Vec<u16>,
+}
+
+/// Load-time measurement of one registered sample (mono PCM).
+#[derive(Debug, Clone, Copy)]
+pub struct Level {
+    pub rms: f32,
+    pub peak: f32,
 }
 
 /// Result of [`load_manifest`]: the profiles that loaded plus one error per
@@ -192,16 +203,24 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
         return Err(Error::Registry(dir.join(&raw.id)));
     }
     // Phase 2: all decoded and capacity confirmed — register.
+    let mut levels = HashMap::with_capacity(needed);
     let presses = register_list(presses, mixer)?;
+    levels.extend(presses.iter().copied());
+    let presses = presses.into_iter().map(|(id, _)| id).collect();
     let releases = register_list(releases, mixer)?;
+    levels.extend(releases.iter().copied());
+    let releases = releases.into_iter().map(|(id, _)| id).collect();
     let keys = keys
         .into_iter()
         .map(|(keyid, p, r)| {
+            let p = register_list(p, mixer)?;
+            let r = register_list(r, mixer)?;
+            levels.extend(p.iter().chain(r.iter()).copied());
             Ok((
                 keyid,
                 KeySamples {
-                    presses: register_list(p, mixer)?,
-                    releases: register_list(r, mixer)?,
+                    presses: p.into_iter().map(|(id, _)| id).collect(),
+                    releases: r.into_iter().map(|(id, _)| id).collect(),
                 },
             ))
         })
@@ -217,6 +236,7 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
         presses,
         releases,
         keys,
+        levels,
         provenance: raw.provenance,
     })
 }
@@ -234,13 +254,26 @@ fn stage_list(dir: &Path, paths: &[String]) -> Result<Staged, Error> {
         .collect()
 }
 
-/// Register staged PCM into the mixer.
-fn register_list(staged: Staged, mixer: &mut Mixer) -> Result<Vec<u16>, Error> {
+/// Register staged PCM into the mixer; returns `(id, measured level)` pairs
+/// (rms/peak computed over the mono PCM, consumed by engine normalization).
+fn register_list(staged: Staged, mixer: &mut Mixer) -> Result<Vec<(u16, Level)>, Error> {
     staged
         .into_iter()
-        .map(|(path, pcm, rate)| match mixer.register(pcm, rate) {
-            u16::MAX => Err(Error::Registry(path)),
-            id => Ok(id),
+        .map(|(path, pcm, rate)| {
+            let mut sum = 0.0f32;
+            let mut peak = 0.0f32;
+            for &s in pcm.iter() {
+                sum += s * s;
+                peak = peak.max(s.abs());
+            }
+            let level = Level {
+                rms: (sum / pcm.len().max(1) as f32).sqrt(),
+                peak,
+            };
+            match mixer.register(pcm, rate) {
+                u16::MAX => Err(Error::Registry(path)),
+                id => Ok((id, level)),
+            }
         })
         .collect()
 }

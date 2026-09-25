@@ -233,6 +233,16 @@ impl Mixer {
         }
     }
 
+    /// Drain queued triggers without rendering (engine tests inspect fields).
+    #[cfg(test)]
+    pub(crate) fn drain(&mut self) -> Vec<Trigger> {
+        let mut out = Vec::new();
+        while let Ok(t) = self.consumer.pop() {
+            out.push(t);
+        }
+        out
+    }
+
     /// Silence all voices and drop pending triggers. Call while render is stopped.
     pub fn clear(&mut self) {
         self.voices = [Voice::default(); MAX_VOICES];

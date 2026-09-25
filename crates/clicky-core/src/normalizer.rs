@@ -22,6 +22,8 @@ pub enum Phase {
 /// A normalized key event ready for the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyEvent {
+    /// evdev device id — release pairing is per-device.
+    pub device: u32,
     /// HID "page:usage" identity string.
     pub keyid: &'static str,
     /// HID usage.
@@ -71,6 +73,7 @@ impl Normalizer {
             _ => return None,
         };
         Some(KeyEvent {
+            device,
             keyid,
             usage,
             page,
