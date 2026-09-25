@@ -51,13 +51,27 @@ cpal default output → PipeWire; `StreamConfig` from device default; request
 ~128-frame buffer where honored. Device picker over IPC; stream rebuild on
 device loss with debounce (in-flight sounds cut — accepted).
 
-## Measured latency (fill from `--diagnostics`)
+## Measured latency
 
-| Config | Buffer | Key→audio latency | Host backend |
-|---|---|---|---|
-| default output config | — | — | — |
-| Fixed(128) | — | — | — |
-| Fixed(64) | — | — | — |
+Measured 2026-09-26 by `cargo run -p clicky --bin audio_probe` (spike:
+`sounds/thocky/press-01.wav` via `Mixer::producer()` → `Trigger` → `render()`
+in the cpal callback). Fedora 44, PipeWire via pipewire-alsa.
 
-Targets: <10 ms key→audio, <1% CPU idle, <50 MB RSS headless.
-Numbers recorded here only after measurement — never claimed.
+| Field | Value |
+|---|---|
+| cpal hosts offered | `[Alsa]` only (no pulse/jack in this build) |
+| Default device | `default` (pipewire-alsa → PipeWire) |
+| Default config | 2 ch, 44100 Hz, f32, buffer range 1..=4194304 |
+| Negotiated request | `BufferSize::Fixed(128)` — accepted on first try |
+| Frames/callback | ~59 (mostly 59, some 58; PipeWire resample 44.1k→48k quantum) |
+| Playback delay reported | 2.7–2.9 ms/callback (`playback − callback`) |
+| Trigger→first-nonzero cb | 0.41 ms |
+| **Est. trigger→DAC latency** | **≈3.3 ms** (queueing 0.4 + playback delay 2.9) |
+
+`Fixed(128)` was honored — no fallback needed; `Fixed(64)`/`Fixed(256)`/
+`Default` untested-as-needed. Even the spec target buffer easily beats the
+<10 ms budget; 3.3 ms estimate excludes the evdev→enqueue hop (~µs–ms).
+
+Note: at 44.1 kHz device rate a 128-frame *request* yields ~59-frame
+callbacks — PipeWire keeps its own ~64-frame @48 kHz quantum and slices the
+stream buffer. If a device negotiates at 48 kHz directly, expect ~128.
