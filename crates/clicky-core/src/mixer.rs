@@ -219,6 +219,11 @@ impl Mixer {
         id
     }
 
+    /// Samples registered so far (registry watermark).
+    pub fn registered_count(&self) -> usize {
+        self.samples.len()
+    }
+
     /// Enqueue a trigger through the embedded producer (tests / offline use).
     /// `false` when invalid, the queue is full, or the producer was taken.
     pub fn enqueue(&mut self, t: Trigger) -> bool {

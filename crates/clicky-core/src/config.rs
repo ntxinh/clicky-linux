@@ -384,11 +384,16 @@ impl ShortcutModifiers {
     }
 
     /// True if `held` (engine mask, bit = usage − 224) contains every kind
-    /// this mask requires; either side counts. FUNCTION never matches (no
-    /// page-7 usage). Exact-equality checks are the recognizer's job.
+    /// this mask requires; either side counts. Exact-equality checks are the
+    /// recognizer's job. FUNCTION has no page-7 usage, so a mask that requires
+    /// only it (or nothing but it) never matches — an empty OptionSet
+    /// (rawValue 0) is the only always-match.
     pub fn matches(&self, held: u8) -> bool {
         let kinds = Self::from_held_mask(held).raw_value;
         let required = self.raw_value & !Self::FUNCTION.raw_value;
+        if required == 0 {
+            return self.raw_value == 0;
+        }
         kinds & required == required
     }
 }
@@ -930,6 +935,15 @@ mod tests {
         assert!(!ShortcutModifiers::COMMAND.matches(1 << 0));
         // LShift (225) + RShift (229) same kind.
         assert_eq!(ShortcutModifiers::from_held_mask(1 << 1 | 1 << 5).raw_value, 2);
+    }
+
+    #[test]
+    fn function_only_mask_never_matches() {
+        let f = ShortcutModifiers::FUNCTION;
+        assert!(!f.matches(0), "Fn-only mask must not fire on bare taps");
+        assert!(!f.matches(1 << 0), "Fn isn't a tracked held modifier");
+        // Empty OptionSet is the only always-match.
+        assert!(ShortcutModifiers { raw_value: 0 }.matches(0));
     }
 
     #[test]

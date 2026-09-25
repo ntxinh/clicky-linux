@@ -162,8 +162,9 @@ pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error>
 type Staged = Vec<(PathBuf, Arc<[f32]>, u32)>;
 
 /// Resolve one profile in two phases: decode + validate every file first
-/// (nothing touches the mixer), then register only if all decode — a failed
-/// profile leaves zero orphaned slots in the registry.
+/// (nothing touches the mixer), then — after a capacity pre-check against
+/// [`crate::mixer::MAX_SAMPLES`] — register only if all fit. A failed profile
+/// leaves zero orphaned slots in the registry.
 fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profile, Error> {
     // Phase 1: decode all.
     let presses = stage_list(dir, &raw.samples)?;
@@ -182,7 +183,15 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
             },
         ));
     }
-    // Phase 2: all decoded — register.
+    // Capacity pre-check: fail before any register() call so a too-big
+    // profile can't orphan slots already claimed for it.
+    let needed = presses.len()
+        + releases.len()
+        + keys.iter().map(|(_, p, r)| p.len() + r.len()).sum::<usize>();
+    if mixer.registered_count() + needed > crate::mixer::MAX_SAMPLES {
+        return Err(Error::Registry(dir.join(&raw.id)));
+    }
+    // Phase 2: all decoded and capacity confirmed — register.
     let presses = register_list(presses, mixer)?;
     let releases = register_list(releases, mixer)?;
     let keys = keys
