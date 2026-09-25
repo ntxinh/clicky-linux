@@ -132,12 +132,40 @@ pub fn run() -> i32 {
         eprintln!("clicky: {}: {}", i.path.display(), i.error);
     }
     let quit = Arc::new(AtomicBool::new(false));
-    let input_handle = spawn_input(enumerated.keyboards, shared.clone(), quit.clone());
+    // Input-thread liveness for `status`: set inside the reader loop, cleared
+    // when it exits — a dead loop must never report `capture: "live"`.
+    let capture_alive = Arc::new(AtomicBool::new(false));
+    let input_handle = spawn_input(
+        enumerated.keyboards,
+        shared.clone(),
+        quit.clone(),
+        capture_alive.clone(),
+    );
 
     // Control socket: stale socket file gets reclaimed; a live one means a
     // second daemon — exit rather than double-consume evdev.
     let sock_dir = socket_dir();
     if let Err(e) = std::fs::create_dir_all(&sock_dir) {
+        eprintln!("clicky: {}: {e}", sock_dir.display());
+        return 1;
+    }
+    // The /tmp fallback dir would land at umask-0755 — lock it down so no
+    // other user can pre-bind the socket, and refuse a foreign-owned dir.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = match std::fs::metadata(&sock_dir) {
+        Ok(m) if m.uid() == unsafe { libc::getuid() } => m,
+        Ok(_) => {
+            eprintln!("clicky: {} not owned by us", sock_dir.display());
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("clicky: {}: {e}", sock_dir.display());
+            return 1;
+        }
+    };
+    let mut perms = meta.permissions();
+    perms.set_mode(0o700);
+    if let Err(e) = std::fs::set_permissions(&sock_dir, perms) {
         eprintln!("clicky: {}: {e}", sock_dir.display());
         return 1;
     }
@@ -162,7 +190,15 @@ pub fn run() -> i32 {
 
     while !quit.load(Ordering::Relaxed) && !SIG_QUIT.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => handle(stream, &shared, &controls, &audio, &profile_ids, &quit),
+            Ok((stream, _)) => handle(
+                stream,
+                &shared,
+                &controls,
+                &audio,
+                &profile_ids,
+                &quit,
+                &capture_alive,
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -189,9 +225,11 @@ fn spawn_input(
     devices: Vec<input::HotDevice>,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut normalizer = Normalizer::new();
+        alive.store(true, Ordering::Relaxed);
         let result = input::run(
             devices,
             |ev| match ev {
@@ -222,6 +260,7 @@ fn handle(
     audio: &Audio,
     profile_ids: &[String],
     quit: &Arc<AtomicBool>,
+    capture_alive: &Arc<AtomicBool>,
 ) {
     // ponytail: sequential accept loop — a silent client would stall control;
     // 5 s is generous for a fire-and-forget CLI.
@@ -234,7 +273,15 @@ fn handle(
     let reply = match read {
         Err(_) => "err read".to_string(),
         Ok(0) => "err empty".to_string(),
-        Ok(_) => command(line.trim(), shared, controls, audio, profile_ids, quit),
+        Ok(_) => command(
+            line.trim(),
+            shared,
+            controls,
+            audio,
+            profile_ids,
+            quit,
+            capture_alive,
+        ),
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.write_all(b"\n");
@@ -249,23 +296,28 @@ fn command(
     audio: &Audio,
     profile_ids: &[String],
     quit: &Arc<AtomicBool>,
+    capture_alive: &Arc<AtomicBool>,
 ) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next(), words.next()) {
-        (Some("status"), None, None) => status_line(shared, audio),
+        (Some("status"), None, None) => status_line(shared, audio, capture_alive),
         (Some("quit"), None, None) => {
             quit.store(true, Ordering::Relaxed);
             "ok".into()
         }
         (Some(cmd @ ("enable" | "disable")), None, None) => {
+            let enable = cmd == "enable";
             let mut sh = shared.lock();
             let mut cfg = sh.store.cfg.clone();
-            cfg.enabled = cmd == "enable";
+            cfg.enabled = enable;
+            // Apply to the live path first; a failed persist rolls the store
+            // back so status can never diverge from the engine.
+            sh.engine.update_config(cfg.clone());
+            controls.set_enabled(enable);
             if let Err(e) = sh.store.save_debounced(&cfg) {
+                sh.store.cfg.enabled = !enable;
                 return format!("err {e}");
             }
-            sh.engine.update_config(cfg);
-            controls.set_enabled(cmd == "enable");
             "ok".into()
         }
         (Some("profile"), Some(id), None) => {
@@ -274,11 +326,13 @@ fn command(
             }
             let mut sh = shared.lock();
             let mut cfg = sh.store.cfg.clone();
+            let prev = cfg.sound.profile_id.clone();
             cfg.sound.profile_id = id.to_string();
+            sh.engine.update_config(cfg.clone());
             if let Err(e) = sh.store.save_debounced(&cfg) {
+                sh.store.cfg.sound.profile_id = prev;
                 return format!("err {e}");
             }
-            sh.engine.update_config(cfg);
             "ok".into()
         }
         _ => "err unknown command".to_string(),
@@ -286,16 +340,20 @@ fn command(
 }
 
 /// `status` reply: one JSON line.
-fn status_line(shared: &Arc<Mutex<Shared>>, audio: &Audio) -> String {
-    // Live re-enumerate — the input thread keeps no readable status surface.
+fn status_line(shared: &Arc<Mutex<Shared>>, audio: &Audio, alive: &Arc<AtomicBool>) -> String {
+    // Enumerate readable nodes for counts; the reader's own liveness flag
+    // decides "live" vs "dead" so a crashed loop never lies.
     let scan = input::keyboard_devices();
+    let alive = alive.load(Ordering::Relaxed);
     let stats = audio.stats();
     let sh = shared.lock();
     serde_json::json!({
         "enabled": sh.store.cfg.enabled,
         "profile": sh.engine.profile_id(),
         "audio_device": audio.device_name(),
-        "capture": if !scan.keyboards.is_empty() {
+        "capture": if !alive {
+            "dead"
+        } else if !scan.keyboards.is_empty() {
             "live"
         } else if scan.issues.is_empty() {
             "no-keyboards"
