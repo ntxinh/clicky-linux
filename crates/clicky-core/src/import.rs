@@ -26,7 +26,7 @@
 //! `user-packs.json` index gains the new entry.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -49,6 +49,12 @@ pub enum ImportError {
     /// Any filesystem write (copy, `profile.json`, index) failed.
     #[error("{0}: {1}")]
     Io(PathBuf, #[source] std::io::Error),
+    /// A manifest sample path escapes the pack dir (`..` or absolute).
+    #[error("{0}: path \"{1}\" escapes the pack directory")]
+    Escapes(String, String),
+    /// Import destination would be created inside the source pack dir.
+    #[error("destination {0} is inside the source pack directory")]
+    Nested(PathBuf),
     /// Referenced audio file missing/undecodable/over-length/too many samples.
     #[error(transparent)]
     Sample(#[from] profiles::Error),
@@ -210,18 +216,28 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
 
     // Phase 1: decode every referenced file (nothing registered yet).
     let (def_press, def_release) = paths_of(raw.default.as_ref());
+    check_paths("default", def_press)?;
+    check_paths("default", def_release)?;
     let staged_presses = profiles::stage_list(src_dir, def_press)?;
     let staged_releases = profiles::stage_list(src_dir, def_release)?;
     let mut warnings = Vec::new();
     // (keyid, press paths, release paths (None = thock fallback to default),
     // staged press, staged release)
     let mut keys = Vec::new();
+    let mut seen_keyids = std::collections::HashSet::new();
     for (name, ks) in raw.keys.take().unwrap_or_default() {
         let Some(keyid) = name_to_keyid(&name) else {
             warnings.push(format!("unknown key name \"{name}\" — dropped"));
             continue;
         };
+        if !seen_keyids.insert(keyid) {
+            warnings.push(format!("key \"{name}\" duplicates {keyid} — dropped"));
+            continue;
+        }
         let (press_paths, rel_paths) = paths_of(Some(&ks));
+        let entry = format!("keys.{name}");
+        check_paths(&entry, press_paths)?;
+        check_paths(&entry, rel_paths)?;
         keys.push((
             keyid,
             press_paths.to_vec(),
@@ -255,7 +271,21 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
         .unwrap_or(&base)
         .to_owned();
     if !same_dir(src_dir, &dest_dir) {
-        copy_dir(src_dir, &dest_dir)?;
+        // Reject a dest nested inside src — the freshly-created dest would be
+        // enumerated by read_dir(src) and recurse into itself.
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|e| ImportError::Io(dest_dir.clone(), e))?;
+        let cdest = dest_dir
+            .canonicalize()
+            .map_err(|e| ImportError::Io(dest_dir.clone(), e))?;
+        let csrc = src_dir
+            .canonicalize()
+            .map_err(|e| ImportError::Read(src_dir.to_path_buf(), e))?;
+        if cdest.starts_with(&csrc) {
+            let _ = std::fs::remove_dir(&dest_dir); // just-created, still empty
+            return Err(ImportError::Nested(dest_dir));
+        }
+        copy_dir(src_dir, &dest_dir, &cdest)?;
     }
     write_profile_json(&dest_dir, &id, &name, &raw, def_press, def_release, &keys)?;
 
@@ -445,19 +475,40 @@ fn slug(name: &str) -> String {
 }
 
 /// Recursive copy of a directory's regular files (subdirs included, links
-/// and specials skipped — packs are plain file trees).
-fn copy_dir(src: &Path, dest: &Path) -> Result<(), ImportError> {
+/// and specials skipped — packs are plain file trees). `exclude` is the
+/// canonical path of a directory that must never be copied into (the dest
+/// itself — belt-and-braces for the dest-inside-src guard in `import_pack`,
+/// e.g. symlinked paths where canonicalization surprises).
+fn copy_dir(src: &Path, dest: &Path, exclude: &Path) -> Result<(), ImportError> {
     std::fs::create_dir_all(dest).map_err(|e| ImportError::Io(dest.to_path_buf(), e))?;
     for entry in std::fs::read_dir(src).map_err(|e| ImportError::Read(src.to_path_buf(), e))? {
         let entry = entry.map_err(|e| ImportError::Read(src.to_path_buf(), e))?;
         let ty = entry
             .file_type()
             .map_err(|e| ImportError::Read(entry.path(), e))?;
+        if entry.path().canonicalize().ok().as_deref() == Some(exclude) {
+            continue;
+        }
         let to = dest.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir(&entry.path(), &to)?;
+            copy_dir(&entry.path(), &to, exclude)?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), &to).map_err(|e| ImportError::Io(to.clone(), e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject manifest sample paths that would resolve outside the pack dir:
+/// `..` (ParentDir) and absolute paths (RootDir/Prefix). Per-file error names
+/// the manifest entry (`default`, `keys.Space`) and the offending path.
+fn check_paths(entry: &str, paths: &[String]) -> Result<(), ImportError> {
+    for p in paths {
+        let bad = Path::new(p)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+        if bad {
+            return Err(ImportError::Escapes(entry.to_string(), p.clone()));
         }
     }
     Ok(())
@@ -711,5 +762,80 @@ mod tests {
         assert_eq!(name_to_keyid("F12"), Some("7:69"));
         assert_eq!(name_to_keyid("7:44"), None);
         assert_eq!(name_to_keyid("Nope"), None);
+    }
+
+    #[test]
+    fn escaping_sample_paths_rejected() {
+        let (_d, src, dest) = dirs("escape");
+        wav(&src, "gen.wav", 480);
+        // Absolute and `..` paths are rejected before decode/copy.
+        for bad in ["../evil.wav", "/etc/passwd", "sub/../../evil.wav"] {
+            std::fs::write(
+                src.join("pack.json"),
+                format!(r#"{{"name":"Esc","default":{{"press":"{bad}"}}}}"#),
+            )
+            .unwrap();
+            let mut mixer = Mixer::new(48000);
+            match import_pack(&src, &dest, &mut mixer) {
+                Err(ImportError::Escapes(entry, path)) => {
+                    assert_eq!(entry, "default");
+                    assert_eq!(path, bad);
+                }
+                other => panic!("expected Escapes for {bad}, got {other:?}"),
+            }
+        }
+        // Same guard applies to keys.* entries.
+        wav(&src, "gen.wav", 480);
+        std::fs::write(
+            src.join("pack.json"),
+            r#"{"name":"Esc2","default":{"press":"gen.wav"},
+                "keys":{"Space":{"press":"../evil.wav"}}}"#,
+        )
+        .unwrap();
+        let mut mixer = Mixer::new(48000);
+        match import_pack(&src, &dest, &mut mixer) {
+            Err(ImportError::Escapes(entry, _)) => assert_eq!(entry, "keys.Space"),
+            other => panic!("expected Escapes, got {other:?}"),
+        }
+        assert!(!dest.join("esc").exists());
+    }
+
+    #[test]
+    fn dest_inside_src_rejected() {
+        let (_d, src, _dest) = dirs("nested");
+        wav(&src, "gen.wav", 480);
+        std::fs::write(
+            src.join("pack.json"),
+            r#"{"name":"Nest","default":{"press":"gen.wav"}}"#,
+        )
+        .unwrap();
+        let mut mixer = Mixer::new(48000);
+        match import_pack(&src, &src.join("nested"), &mut mixer) {
+            Err(ImportError::Nested(p)) => assert_eq!(p.file_name().unwrap(), "nest"),
+            other => panic!("expected Nested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_keyid_first_wins() {
+        let (_d, src, dest) = dirs("dupkey");
+        wav(&src, "gen.wav", 480);
+        wav(&src, "l.wav", 480);
+        wav(&src, "s.wav", 480);
+        // "LeftShift" and "Shift" both map to 7:225 — first wins.
+        std::fs::write(
+            src.join("pack.json"),
+            r#"{"name":"Dup","default":{"press":"gen.wav"},
+                "keys":{"LeftShift":{"press":"l.wav"},"Shift":{"press":"s.wav"}}}"#,
+        )
+        .unwrap();
+        let mut mixer = Mixer::new(48000);
+        let p = import_pack(&src, &dest, &mut mixer).unwrap();
+        assert_eq!(p.keys.len(), 1);
+        assert_eq!(p.keys["7:225"].presses.len(), 1);
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("duplicates 7:225"));
+        // Only 2 samples registered (gen + l.wav); s.wav never staged.
+        assert_eq!(mixer.registered_count(), 2);
     }
 }

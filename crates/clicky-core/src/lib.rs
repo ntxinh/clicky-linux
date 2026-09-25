@@ -9,6 +9,7 @@
 pub mod audio;
 pub mod config;
 pub mod diagnostics;
+pub mod engine;
 pub mod import;
 pub mod input;
 pub mod keymap;
