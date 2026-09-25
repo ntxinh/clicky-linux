@@ -191,15 +191,28 @@ pub fn name_to_keyid(name: &str) -> Option<&'static str> {
         .map(|(_, id)| *id)
 }
 
-/// Import the pack at `src_dir` into `dest_root/<slug>/`, decode its audio
-/// and register every sample in `mixer`.
-///
-/// Order is decode-everything → capacity pre-check → copy → write
-/// `profile.json` → register → append the `user-packs.json` index. A bad
-/// manifest or audio file fails before anything is copied or registered.
-/// Returns the runtime [`Profile`] (mixer sample ids); non-fatal drops land
-/// in `profile.warnings`.
-pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Result<Profile, ImportError> {
+/// Pack decoded to PCM but not yet copied or registered — the lock-free half
+/// of [`import_pack`]. See that function for ordering guarantees.
+pub struct StagedPack {
+    src_dir: PathBuf,
+    raw: RawPack,
+    name: String,
+    base: String,
+    def_press: Vec<String>,
+    def_release: Vec<String>,
+    staged_presses: profiles::Staged,
+    staged_releases: profiles::Staged,
+    /// (keyid, press paths, release paths (None = thock fallback to default),
+    /// staged press, staged release)
+    keys: Vec<(&'static str, Vec<String>, Option<Vec<String>>, profiles::Staged, profiles::Staged)>,
+    warnings: Vec<String>,
+}
+
+/// Read `src_dir/pack.json` and decode every referenced file — touches no
+/// mixer state, so callers holding a shared mixer (`Audio::mixer()`) can do
+/// the slow decode OUTSIDE the lock. Pair with [`import_staged`], which only
+/// needs the mixer for the append loop. `import_pack` = stage + import.
+pub fn stage_pack(src_dir: &Path) -> Result<StagedPack, ImportError> {
     let manifest_path = src_dir.join("pack.json");
     let text = std::fs::read(&manifest_path)
         .map_err(|e| ImportError::Read(manifest_path.clone(), e))?;
@@ -214,15 +227,20 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
         return Err(ImportError::BadName);
     }
 
-    // Phase 1: decode every referenced file (nothing registered yet).
-    let (def_press, def_release) = paths_of(raw.default.as_ref());
-    check_paths("default", def_press)?;
-    check_paths("default", def_release)?;
-    let staged_presses = profiles::stage_list(src_dir, def_press)?;
-    let staged_releases = profiles::stage_list(src_dir, def_release)?;
+    // Decode every referenced file (nothing registered or copied yet).
+    // `def_*` are owned copies so `raw` can move into `StagedPack`.
+    let (def_press, def_release, staged_presses, staged_releases) = {
+        let (p, r) = paths_of(raw.default.as_ref());
+        check_paths("default", p)?;
+        check_paths("default", r)?;
+        (
+            p.to_vec(),
+            r.to_vec(),
+            profiles::stage_list(src_dir, p)?,
+            profiles::stage_list(src_dir, r)?,
+        )
+    };
     let mut warnings = Vec::new();
-    // (keyid, press paths, release paths (None = thock fallback to default),
-    // staged press, staged release)
     let mut keys = Vec::new();
     let mut seen_keyids = std::collections::HashSet::new();
     for (name, ks) in raw.keys.take().unwrap_or_default() {
@@ -251,6 +269,40 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
         ));
     }
 
+    Ok(StagedPack {
+        src_dir: src_dir.to_path_buf(),
+        raw,
+        name,
+        base,
+        def_press,
+        def_release,
+        staged_presses,
+        staged_releases,
+        keys,
+        warnings,
+    })
+}
+
+/// Copy a [`stage_pack`]ed pack into `dest_root/<slug>/`, write `profile.json`
+/// and `user-packs.json`, and register every staged sample. This is the only
+/// mixer-touching half — hold the shared mixer lock just for this call.
+pub fn import_staged(
+    staged: StagedPack,
+    dest_root: &Path,
+    mixer: &mut Mixer,
+) -> Result<Profile, ImportError> {
+    let StagedPack {
+        src_dir,
+        raw,
+        name,
+        base,
+        def_press,
+        def_release,
+        staged_presses,
+        staged_releases,
+        keys,
+        warnings,
+    } = staged;
 
     let needed = staged_presses.len()
         + staged_releases.len()
@@ -262,15 +314,15 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
     }
 
     // Copy to dest_root/<slug>/ (skip when already in place), write the
-    // converted profile.json, then phase 2: register.
-    let dest_dir = pick_dest(dest_root, &base, src_dir);
+    // converted profile.json, then register.
+    let dest_dir = pick_dest(dest_root, &base, &src_dir);
     // id = chosen dir name so a "same-2" pack gets a distinct runtime id.
     let id = dest_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&base)
         .to_owned();
-    if !same_dir(src_dir, &dest_dir) {
+    if !same_dir(&src_dir, &dest_dir) {
         // Reject a dest nested inside src — the freshly-created dest would be
         // enumerated by read_dir(src) and recurse into itself.
         std::fs::create_dir_all(&dest_dir)
@@ -285,9 +337,9 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
             let _ = std::fs::remove_dir(&dest_dir); // just-created, still empty
             return Err(ImportError::Nested(dest_dir));
         }
-        copy_dir(src_dir, &dest_dir, &cdest)?;
+        copy_dir(&src_dir, &dest_dir, &cdest)?;
     }
-    write_profile_json(&dest_dir, &id, &name, &raw, def_press, def_release, &keys)?;
+    write_profile_json(&dest_dir, &id, &name, &raw, &def_press, &def_release, &keys)?;
 
     let mut levels = std::collections::HashMap::with_capacity(needed);
     let presses = profiles::register_list(staged_presses, mixer)?;
@@ -332,6 +384,19 @@ pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Resul
     };
     append_user_pack_index(dest_root, &profile)?;
     Ok(profile)
+}
+
+/// Import the pack at `src_dir` into `dest_root/<slug>/`, decode its audio
+/// and register every sample in `mixer` — [`stage_pack`] + [`import_staged`]
+/// in one call (fine at startup or when the mixer lock is uncontended).
+///
+/// Order is decode-everything → capacity pre-check → copy → write
+/// `profile.json` → register → append the `user-packs.json` index. A bad
+/// manifest or audio file fails before anything is copied or registered.
+/// Returns the runtime [`Profile`] (mixer sample ids); non-fatal drops land
+/// in `profile.warnings`.
+pub fn import_pack(src_dir: &Path, dest_root: &Path, mixer: &mut Mixer) -> Result<Profile, ImportError> {
+    import_staged(stage_pack(src_dir)?, dest_root, mixer)
 }
 
 /// Append `profile` to `dest_root/user-packs.json` (creating it); an existing

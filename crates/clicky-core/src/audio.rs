@@ -97,7 +97,8 @@ fn base_config(device: &Device) -> Result<StreamConfig, AudioError> {
     device
         .supported_output_configs()
         .map_err(AudioError::Configs)?
-        .find(|r| r.sample_format() == cpal::SampleFormat::F32)
+        .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
+        .max_by_key(|r| r.max_sample_rate().0)
         .map(|r| r.with_max_sample_rate().config())
         .ok_or(AudioError::UnsupportedSampleFormat)
 }
@@ -164,10 +165,15 @@ impl Audio {
         let Ok(devices) = host.output_devices() else {
             return Vec::new();
         };
+        // cpal exposes no stable device identity — flag the first device whose
+        // name matches the default's so duplicates aren't all marked default.
+        let mut default_flagged = false;
         devices
             .filter_map(|d| {
                 let name = d.name().ok()?;
-                Some(DeviceInfo { is_default: Some(&name) == default.as_ref(), name })
+                let is_default = !default_flagged && Some(&name) == default.as_ref();
+                default_flagged |= is_default;
+                Some(DeviceInfo { name, is_default })
             })
             .collect()
     }

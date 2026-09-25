@@ -138,16 +138,22 @@ struct RawKeySamples {
     release_samples: Option<Vec<String>>,
 }
 
-/// Read `dir/profiles.json` and resolve every entry. Manifest-level failures
-/// (file unreadable, top-level JSON not an array) are fatal `Err`; per-entry
-/// failures land in `errors` and that profile is excluded.
-pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error> {
+/// Read `dir/profiles.json` and decode every entry — touches no mixer state,
+/// so callers holding a shared mixer (`Audio::mixer()`) can do the slow
+/// decode OUTSIDE the lock. Pair with [`register_manifest`], which only needs
+/// the mixer for the append loop. `load_manifest` = stage + register.
+///
+/// Manifest-level failures (file unreadable, top-level JSON not an array) are
+/// fatal `Err`; per-entry decode failures land in `errors` and that profile
+/// is excluded.
+pub fn stage_manifest(dir: &Path) -> Result<StagedManifest, Error> {
     let path = dir.join("profiles.json");
     let text = std::fs::read(&path).map_err(|e| Error::Read(path.clone(), e))?;
     let entries: Vec<serde_json::Value> =
         serde_json::from_slice(&text).map_err(|e| Error::Parse(path.clone(), e))?;
 
-    let mut report = LoadReport::default();
+    let mut staged = Vec::new();
+    let mut errors = Vec::new();
     for (i, entry) in entries.into_iter().enumerate() {
         let id = entry
             .get("id")
@@ -158,36 +164,70 @@ pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error>
             Ok(r) => r,
             Err(e) => {
                 // Name manifest + entry id distinctly: logs stay greppable.
-                report
-                    .errors
-                    .push((id.clone(), Error::Parse(path.join(format!("entry[{id}]")), e)));
+                errors.push((id.clone(), Error::Parse(path.join(format!("entry[{id}]")), e)));
                 continue;
             }
         };
-        match load_profile(dir, raw, mixer) {
+        match stage_profile(dir, raw) {
+            Ok(p) => staged.push(p),
+            Err(e) => errors.push((id, e)),
+        }
+    }
+    Ok(StagedManifest { dir: dir.to_path_buf(), staged, errors })
+}
+
+/// Register every profile staged by [`stage_manifest`], producing the same
+/// [`LoadReport`] shape as [`load_manifest`]. This is the only mixer-touching
+/// half — hold the shared mixer lock just for this call (ms, not seconds).
+pub fn register_manifest(staged: StagedManifest, mixer: &mut Mixer) -> LoadReport {
+    let mut report = LoadReport { profiles: Vec::new(), errors: staged.errors };
+    for p in staged.staged {
+        let id = p.raw.id.clone();
+        match register_profile(&staged.dir, p, mixer) {
             Ok(p) => report.profiles.push(p),
             Err(e) => report.errors.push((id, e)),
         }
     }
-    Ok(report)
+    report
+}
+
+/// Read `dir/profiles.json` and resolve every entry: `stage_manifest` +
+/// `register_manifest` in one call (fine at startup, before the stream runs
+/// and the mixer lock is uncontended).
+pub fn load_manifest(dir: &Path, mixer: &mut Mixer) -> Result<LoadReport, Error> {
+    Ok(register_manifest(stage_manifest(dir)?, mixer))
+}
+
+/// Manifest decoded to PCM but not yet registered — the lock-free half of a
+/// [`load_manifest`]. `errors` carries entries that failed decode/parse.
+pub struct StagedManifest {
+    dir: PathBuf,
+    staged: Vec<StagedProfile>,
+    errors: Vec<(String, Error)>,
+}
+
+/// One profile decoded to PCM but not yet registered.
+struct StagedProfile {
+    raw: RawProfile,
+    presses: Staged,
+    releases: Staged,
+    keys: Vec<(String, Staged, Staged)>,
 }
 
 /// Decoded-but-unregistered sample: `(resolved path, mono pcm, src_rate)`.
 pub(crate) type Staged = Vec<(PathBuf, Arc<[f32]>, u32)>;
 
-/// Resolve one profile in two phases: decode + validate every file first
-/// (nothing touches the mixer), then — after a capacity pre-check against
-/// [`crate::mixer::MAX_SAMPLES`] — register only if all fit. A failed profile
+/// Decode + validate every file of one profile — no mixer touched. All
+/// failures happen before a single `register` call, so a failed profile
 /// leaves zero orphaned slots in the registry.
-fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profile, Error> {
-    // Phase 1: decode all.
+fn stage_profile(dir: &Path, mut raw: RawProfile) -> Result<StagedProfile, Error> {
     let presses = stage_list(dir, &raw.samples)?;
     let releases = match &raw.release_samples {
         Some(paths) => stage_list(dir, paths)?,
         None => Vec::new(),
     };
     let mut keys = Vec::with_capacity(raw.key_samples.as_ref().map_or(0, HashMap::len));
-    for (keyid, ks) in raw.key_samples.unwrap_or_default() {
+    for (keyid, ks) in raw.key_samples.take().unwrap_or_default() {
         keys.push((
             keyid,
             stage_list(dir, &ks.samples)?,
@@ -197,6 +237,13 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
             },
         ));
     }
+    Ok(StagedProfile { raw, presses, releases, keys })
+}
+
+/// Capacity pre-check + register a staged profile. Call under the mixer lock;
+/// it holds it only for the append loop.
+fn register_profile(dir: &Path, staged: StagedProfile, mixer: &mut Mixer) -> Result<Profile, Error> {
+    let StagedProfile { raw, presses, releases, keys } = staged;
     // Capacity pre-check: fail before any register() call so a too-big
     // profile can't orphan slots already claimed for it.
     let needed = presses.len()
@@ -205,7 +252,6 @@ fn load_profile(dir: &Path, raw: RawProfile, mixer: &mut Mixer) -> Result<Profil
     if mixer.registered_count() + needed > crate::mixer::MAX_SAMPLES {
         return Err(Error::Registry(dir.join(&raw.id)));
     }
-    // Phase 2: all decoded and capacity confirmed — register.
     let mut levels = HashMap::with_capacity(needed);
     let presses = register_list(presses, mixer)?;
     levels.extend(presses.iter().copied());
