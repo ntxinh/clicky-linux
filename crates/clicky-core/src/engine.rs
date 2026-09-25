@@ -73,7 +73,9 @@ fn norm_gain(rms: f32, peak: f32, profile_gain: f32, target: f32, silent: bool) 
     let correction = (target / (rms * profile_gain)).powf(0.75);
     let headroom = 0.65 / (peak * profile_gain);
     let cap: f32 = if silent { 1.0 } else { 1.8 };
-    correction.clamp(0.5, cap.min(headroom))
+    // Swift `clamped(to:)` tolerates upper < lower (result = upper);
+    // `f32::clamp` panics. A peak×gain > 1.3 would otherwise crash profile load.
+    correction.max(0.5).min(cap.min(headroom))
 }
 
 /// `AudioSampleSelector.index`: random index ≠ previous when possible.
@@ -260,6 +262,13 @@ impl Engine {
             }
             return;
         }
+        if ev.page == 9 {
+            // Mouse buttons aren't in the v1 keyboard path (Clicky routes them
+            // to a separate mouse sound). Press records a nil intent so the
+            // release can never fire; the release branch above consumes it.
+            self.releases.insert(key, None);
+            return;
+        }
         if !self.config.enabled {
             // Muted press → remembered nil → silent release.
             self.releases.insert(key, None);
@@ -311,28 +320,21 @@ impl Engine {
     }
 
     /// Audition a key immediately: enqueue the resolved press then the
-    /// paired release (a real hold isn't needed for a preview).
+    /// paired release (a real hold isn't needed for a preview). Previews
+    /// the PROFILE DEFAULT, like Clicky — key overrides don't apply.
     pub fn preview(&mut self, keyid: &str) {
         if self.profiles.is_empty() {
             return;
         }
-        let over = self.config.key_overrides.get(keyid);
-        let s = &self.config.sound;
-        let volume = over.and_then(|o| o.volume).unwrap_or(s.volume);
-        let tone = over.and_then(|o| o.tone).unwrap_or(s.tone);
-        let pitch = over.and_then(|o| o.pitch).unwrap_or(s.pitch);
-        let pidx = match over.and_then(|o| o.profile_id.as_deref()) {
-            Some(id) => self
-                .profiles
-                .iter()
-                .position(|p| p.id == id)
-                .or_else(|| self.profiles.iter().position(|p| p.id == "thocky"))
-                .unwrap_or(self.active),
-            None => self.active,
+        let (tone, pitch, volume) = {
+            let s = &self.config.sound;
+            (s.tone, s.pitch, s.volume)
         };
-        let press = self.profile_trigger(pidx, Phase::Press, keyid, tone, pitch, volume, 0.0, None);
+        let press =
+            self.profile_trigger(self.active, Phase::Press, keyid, tone, pitch, volume, 0.0, None);
         let shared = press.as_ref().map(|p| p.norm);
-        let release = self.profile_trigger(pidx, Phase::Release, keyid, tone, pitch, volume, 0.0, shared);
+        let release =
+            self.profile_trigger(self.active, Phase::Release, keyid, tone, pitch, volume, 0.0, shared);
         let (press, release) = self.pair(press, release);
         if let Some(p) = press {
             self.producer.push(p);
@@ -846,6 +848,70 @@ mod tests {
         // Preview doesn't touch the release tracker.
         eng.on_key(&kev("7:30", 30, Phase::Release));
         assert!(mixer.drain().is_empty());
+    }
+
+    #[test]
+    fn norm_gain_upper_below_floor_no_panic() {
+        // peak×gain = 2.0 → headroom 0.325 < 0.5 floor. Rust clamp panics;
+        // Swift clamped(to:) yields upper. Regression: hot sample + hot gain.
+        let g = norm_gain(0.5, 1.0, 2.0, 0.06, false);
+        assert!((g - 0.325).abs() < 1e-3, "norm {g}");
+        // End-to-end: such a profile resolves without panic.
+        let mut mixer = Mixer::new(48000);
+        let mut p = profile(&mut mixer, "thocky", 0.3, 1, 1);
+        let hot = register(&mut mixer, 1.0);
+        p.presses = vec![hot];
+        p.gain = 2.0;
+        p.levels.insert(hot, Level { rms: 1.0, peak: 1.0 });
+        let producer = mixer.producer().unwrap();
+        let mut eng = Engine::new(AppConfiguration::default().validated(), vec![p], producer);
+        eng.on_key(&kev("7:30", 30, Phase::Press));
+        let t = mixer.drain();
+        assert_eq!(t.len(), 1);
+        assert!(t[0].gain.is_finite() && t[0].gain > 0.0);
+    }
+
+    #[test]
+    fn mouse_button_events_are_silent() {
+        let mut mixer = Mixer::new(48000);
+        let p = profile(&mut mixer, "thocky", 0.3, 1, 1);
+        let producer = mixer.producer().unwrap();
+        let mut eng = Engine::new(raw_cfg(), vec![p], producer);
+        let mut ev = kev("9:1", 1, Phase::Press);
+        ev.page = 9;
+        eng.on_key(&ev);
+        ev.phase = Phase::Release;
+        eng.on_key(&ev);
+        assert!(mixer.drain().is_empty(), "page-9 event produced triggers");
+    }
+
+    #[test]
+    fn preview_ignores_key_overrides() {
+        let mut mixer = Mixer::new(48000);
+        let p0 = profile(&mut mixer, "thocky", 0.3, 1, 1);
+        let p1 = profile(&mut mixer, "alps", 0.3, 1, 1);
+        let thocky_press = p0.presses[0];
+        let mut cfg = raw_cfg();
+        cfg.key_overrides.insert(
+            "7:30".into(),
+            KeyOverride {
+                profile_id: Some("alps".into()),
+                volume: Some(0.9),
+                pitch: Some(-1.0),
+                tone: Some(0.9),
+            },
+        );
+        let producer = mixer.producer().unwrap();
+        let mut eng = Engine::new(cfg.validated(), vec![p0, p1], producer);
+        eng.preview("7:30");
+        let t = mixer.drain();
+        assert_eq!(t.len(), 2);
+        // Clicky previews the profile default: active profile's sample,
+        // slider volume/pitch/tone — none of the override values.
+        assert_eq!(t[0].sample, thocky_press);
+        assert!((t[0].gain - 0.8).abs() < 1e-6, "preview gain {}", t[0].gain);
+        assert_eq!(t[0].pitch, 1.0);
+        assert_eq!(t[0].tone, 0.0);
     }
 
     #[test]
