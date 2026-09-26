@@ -19,12 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clicky_core::audio::{Audio, MixerControls};
-use clicky_core::config::Store;
+use clicky_core::config::{Store, VisualizerSettings};
 use clicky_core::engine::Engine;
 use clicky_core::input::{self, InputEvent};
 use clicky_core::normalizer::Normalizer;
 use clicky_core::profiles;
+use clicky_core::visual::VisualBus;
 use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::process::{Child, Command};
 
 /// Signal-safe shutdown flag; the accept loop polls it (nonblocking accept).
 static SIG_QUIT: AtomicBool = AtomicBool::new(false);
@@ -68,11 +71,143 @@ pub fn sounds_dir() -> PathBuf {
     PathBuf::from("sounds")
 }
 
+/// One supervised `clicky-overlay <kind>` child. `restarts` counts the one
+/// allowed respawn; `failed` freezes the entry so `status` can report it.
+struct OverlayChild {
+    kind: String,
+    child: Option<Child>,
+    restarts: u32,
+    failed: bool,
+}
+
+/// Overlay supervision: spawn `clicky-overlay <kind>` for every enabled
+/// visualizer kind, reap exits, allow ONE restart, then mark `failed` (the
+/// `overlays` field of `status`). Kill on config-off and on shutdown.
+#[derive(Default)]
+pub struct Overlays {
+    children: HashMap<String, OverlayChild>,
+    status: HashMap<String, &'static str>,
+}
+
+impl Overlays {
+    /// Reconcile running children with `vis` — call from any context that
+    /// holds `shared` (accept loop, IPC mutate, diagnostics).
+    pub fn sync(&mut self, vis: &VisualizerSettings) {
+        for ch in self.children.values_mut() {
+            let dead = ch
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+                .is_some();
+            if !dead {
+                continue;
+            }
+            ch.child = None;
+            if ch.failed {
+                continue;
+            }
+            let wanted = vis.enabled && vis.kinds.get(&ch.kind).copied().unwrap_or(false);
+            if wanted && ch.restarts == 0 {
+                ch.restarts = 1;
+                eprintln!("clicky: overlay {} died; restarting once", ch.kind);
+                match spawn_overlay(&ch.kind, vis) {
+                    Ok(child) => ch.child = Some(child),
+                    Err(e) => {
+                        eprintln!("clicky: overlay {} respawn: {e}", ch.kind);
+                        ch.failed = true;
+                    }
+                }
+            } else if wanted {
+                eprintln!("clicky: overlay {} failed after restart", ch.kind);
+                ch.failed = true;
+            }
+        }
+        // Drop entries for kinds no longer enabled (after reap, so a crash
+        // on an enabled kind is reported before the entry goes away).
+        let status = &mut self.status;
+        self.children.retain(|k, ch| {
+            if vis.enabled && vis.kinds.get(k).copied().unwrap_or(false) {
+                status.insert(k.clone(), if ch.failed { "failed" } else { "running" });
+                true
+            } else {
+                if let Some(mut c) = ch.child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                status.remove(k);
+                false
+            }
+        });
+        // Kinds enabled but not yet running.
+        let wanted: Vec<String> = vis
+            .kinds
+            .keys()
+            .filter(|k| vis.enabled && vis.kinds[*k] && !self.children.contains_key(*k))
+            .cloned()
+            .collect();
+        for kind in wanted {
+            match spawn_overlay(&kind, vis) {
+                Ok(child) => {
+                    eprintln!("clicky: overlay {kind} spawned");
+                    self.children.insert(
+                        kind.clone(),
+                        OverlayChild {
+                            kind: kind.clone(),
+                            child: Some(child),
+                            restarts: 0,
+                            failed: false,
+                        },
+                    );
+                    self.status.insert(kind.clone(), "running");
+                }
+                Err(e) => {
+                    eprintln!("clicky: overlay {kind}: {e}");
+                    self.status.insert(kind.clone(), "failed");
+                }
+            }
+        }
+    }
+
+    /// kind → "running" | "failed" for the status reply.
+    pub fn status_map(&self) -> HashMap<String, &'static str> {
+        self.status.clone()
+    }
+
+    /// Kill all children (shutdown path; the FIFO goes away with us anyway).
+    pub fn kill_all(&mut self) {
+        for ch in self.children.values_mut() {
+            if let Some(mut c) = ch.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
+/// Prefer a `clicky-overlay` binary next to our own exe (cargo target dir);
+/// fall back to PATH. `combo` gets the configured timeout via env.
+fn spawn_overlay(kind: &str, vis: &VisualizerSettings) -> std::io::Result<Child> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("clicky-overlay")));
+    let mut cmd = match sibling.filter(|p| p.is_file()) {
+        Some(p) => Command::new(p),
+        None => Command::new("clicky-overlay"),
+    };
+    cmd.arg(kind)
+        .env("CLICKY_COMBO_TIMEOUT", format!("{}", vis.combo_timeout));
+    cmd.spawn()
+}
+
 /// State mutated by the socket handler (main thread), IPC commands and the
 /// input thread: engine for `on_key`/`update_config`, store for saves.
 pub struct Shared {
     pub engine: Engine,
     pub store: Store,
+    /// FIFO writer for visualizer key events (lazy; drops when no reader).
+    pub visual: VisualBus,
+    /// `clicky-overlay <kind>` child processes.
+    pub overlays: Overlays,
 }
 
 /// Everything [`boot`] produced that a caller needs past startup.
@@ -123,7 +258,18 @@ pub fn boot() -> Result<Boot, String> {
 
     controls.set_enabled(store.cfg.enabled);
     let engine = Engine::new(store.cfg.clone(), report.profiles, producer);
-    let shared = Arc::new(Mutex::new(Shared { engine, store }));
+    let shared = Arc::new(Mutex::new(Shared {
+        engine,
+        store,
+        visual: VisualBus::new(),
+        overlays: Overlays::default(),
+    }));
+    // Spawn overlays for any already-enabled kinds.
+    {
+        let mut sh = shared.lock();
+        let vis = sh.store.cfg.visualizer.clone();
+            sh.overlays.sync(&vis);
+    }
 
     // Input thread: enumerate → run loop. EACCES-only enumeration leaves the
     // app headless-but-alive; run()'s retry poll picks nodes up when perms
@@ -165,8 +311,12 @@ pub fn shutdown(boot: &mut Boot) {
     if let Some(h) = boot.input.take() {
         let _ = h.join();
     }
-    if let Err(e) = boot.shared.lock().store.flush() {
-        eprintln!("clicky: config save: {e}");
+    {
+        let mut sh = boot.shared.lock();
+        sh.overlays.kill_all();
+        if let Err(e) = sh.store.flush() {
+            eprintln!("clicky: config save: {e}");
+        }
     }
 }
 
@@ -263,6 +413,12 @@ pub fn run() -> i32 {
                 break;
             }
         }
+        // Reap/respawn overlay children each iteration (20 ms cadence).
+        {
+            let mut sh = b.shared.lock();
+            let vis = sh.store.cfg.visualizer.clone();
+            sh.overlays.sync(&vis);
+        }
     }
 
     shutdown(&mut b);
@@ -290,7 +446,13 @@ fn spawn_input(
                     value,
                 } => {
                     if let Some(kev) = normalizer.feed(device, code, value, false) {
-                        shared.lock().engine.on_key(&kev);
+                        let mut sh = shared.lock();
+                        sh.engine.on_key(&kev);
+                        // Key IDs only, never typed text; drops silently
+                        // when no overlay is reading the FIFO.
+                        if sh.store.cfg.visualizer.any_enabled() {
+                            let _ = sh.visual.emit(&kev);
+                        }
                     }
                 }
                 InputEvent::Dropped { device } => normalizer.clear_held(device),
@@ -366,7 +528,12 @@ pub(crate) fn command(
 ) -> String {
     let mut words = line.split_whitespace();
     match (words.next(), words.next(), words.next()) {
-        (Some("status"), None, None) => status_line(shared, audio, capture_alive),
+        (Some("status"), None, None) => {
+            let mut sh = shared.lock();
+            let vis = sh.store.cfg.visualizer.clone();
+            sh.overlays.sync(&vis);
+            status_line(&sh, audio, capture_alive)
+        }
         // UI-mode only; the daemon is headless — still counts as a live
         // instance so the caller exits instead of double-booting.
         (Some("show"), None, None) => "err daemon mode".to_string(),
@@ -414,9 +581,10 @@ pub(crate) fn command(
     }
 }
 
-/// `status` reply: one JSON line.
+/// `status` reply: one JSON line. Caller holds the `shared` lock and has
+/// already synced overlays so the map is fresh.
 fn status_line(
-    shared: &Arc<Mutex<Shared>>,
+    sh: &Shared,
     audio: &AudioStatus,
     alive: &Arc<AtomicBool>,
 ) -> String {
@@ -424,7 +592,6 @@ fn status_line(
     // decides "live" vs "dead" so a crashed loop never lies.
     let scan = input::keyboard_devices();
     let alive = alive.load(Ordering::Relaxed);
-    let sh = shared.lock();
     serde_json::json!({
         "enabled": sh.store.cfg.enabled,
         "profile": sh.engine.profile_id(),
@@ -440,6 +607,7 @@ fn status_line(
         },
         "keyboards": scan.keyboards.len(),
         "issues": scan.issues.len(),
+        "overlays": sh.overlays.status_map(),
         "accepted": audio.stats.accepted,
         "dropped": audio.stats.dropped,
         "stolen": audio.stats.stolen,

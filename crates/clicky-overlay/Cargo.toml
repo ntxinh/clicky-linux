@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 clicky-core = { path = "../clicky-core" }
-# Needs system libs — uncomment after tools/setup.sh:
-# gtk4 = "0.9"
-# gtk4-layer-shell = "0.5"
+# System libs come from .sysroot/ (tools/sysroot.sh; PKG_CONFIG_PATH is wired
+# in .cargo/config.toml). gtk4-layer-shell 0.8 pairs with gtk4 0.11.
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"

@@ -74,6 +74,8 @@ fn mutate(
         revert(sh, prev);
         return Err(map_err(e));
     }
+    // Spawn/kill overlay children to match the persisted config.
+    sh.overlays.sync(&cfg.visualizer);
     emit_config(app, &cfg);
     Ok(())
 }
@@ -354,7 +356,9 @@ fn get_diagnostics(state: State<AppState>) -> serde_json::Value {
     let scan = input::keyboard_devices();
     let alive = state.capture_alive.load(std::sync::atomic::Ordering::Relaxed);
     // Lock order shared → audio (module doc); both guards die at return.
-    let sh = state.shared.lock();
+    let mut sh = state.shared.lock();
+    let vis = sh.store.cfg.visualizer.clone();
+    sh.overlays.sync(&vis);
     let audio = state.audio.lock();
     let stats = audio.stats();
     serde_json::json!({
@@ -374,6 +378,7 @@ fn get_diagnostics(state: State<AppState>) -> serde_json::Value {
         },
         "keyboards": scan.keyboards.len(),
         "issues": scan.issues.iter().map(|i| format!("{}: {}", i.path.display(), i.error)).collect::<Vec<_>>(),
+        "overlays": sh.overlays.status_map(),
         "accepted": stats.accepted,
         "dropped": stats.dropped,
         "stolen": stats.stolen,

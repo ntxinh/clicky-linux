@@ -347,6 +347,12 @@ impl Default for VisualizerSettings {
 }
 
 impl VisualizerSettings {
+    /// Master `enabled` plus ≥1 kind on — the cheap gate the input thread
+    /// checks before writing to the events FIFO.
+    pub fn any_enabled(&self) -> bool {
+        self.enabled && self.kinds.values().any(|v| *v)
+    }
+
     fn validate(&mut self) {
         self.scale = clamp(self.scale, 0.5, 2.0);
         self.offset = clamp(self.offset, 0.0, 150.0);
