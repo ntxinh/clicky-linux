@@ -645,7 +645,7 @@ fn build_keyboard3d(app: &gtk::Application) -> gtk::ApplicationWindow {
         // Board center in cell units.
         let (cx, cz) = (7.5, 3.25);
         // Orthographic view: yaw around the up-axis, then pitch about
-        // view-x. det=+1 (a real rotation); z2 grows INTO the screen.
+        // view-x. det=+1 (a real rotation); z2 grows TOWARD the camera.
         let proj = |x: f64, y: f64, z: f64| -> (f64, f64, f64) {
             let (dx, dz) = (x - cx, z - cz);
             let x1 = dx * cy - dz * sy;
@@ -745,6 +745,9 @@ fn build_keyboard3d(app: &gtk::Application) -> gtk::ApplicationWindow {
         match ev {
             Ev::Key(_, u, true) => {
                 s.held.insert(u, true);
+                // Seed the spring — the tick lerp runs over `depth`,
+                // never `held`.
+                s.depth.entry(u).or_insert(0.0);
             }
             Ev::Key(_, u, false) => {
                 // Remove rather than store `false` — depth already marks
