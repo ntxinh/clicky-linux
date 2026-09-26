@@ -66,5 +66,24 @@ udev monitor ─┐
 ## Process model
 
 Launch = daemon: config → input thread → engine → mixer → cpal stream →
-Tauri (tray via SNI + hidden settings window). Window close → hide; tray
-Quit → exit. `--daemon` skips the UI entirely for autostart.
+Tauri settings window. Window close → hide keeps the engine alive; quit via
+the Home page or `clicky quit`. `--daemon` skips the UI entirely for
+autostart. No tray icon: libayatana-appindicator isn't in the build sysroot
+(packaged builds declare it as an RPM `Requires:` for when the tray lands).
+
+## Desktop integration
+
+- `.desktop` + icon in `packaging/`; `tools/install.sh` does the user-level
+  install (bins → `~/.local/bin`, sounds → `~/.local/share/clicky`, desktop
+  file, icon); the udev uaccess rule is the only sudo step and is
+  opt-in via `--udev`.
+- Autostart: the `set_launch_at_login` IPC toggle writes/removes
+  `~/.config/autostart/clicky.desktop` (`Exec=clicky --daemon`).
+- **niri pause-on-lock: not implemented.** `niri msg --json event-stream`
+  (26.04) emits workspace/window/layout/overview/cast/config events only —
+  screen locking is delegated to external `ext-session-lock` clients and is
+  invisible to the compositor CLI. The only candidate event,
+  `OverviewOpenedOrClosed`, fires on the app-overview toggle, not on lock;
+  gating on it would mute sounds while typing in a focused window. Hooking
+  lock would need a session-lock client or logind `LockedHint` subscription —
+  out of scope for the CLI-level stretch.

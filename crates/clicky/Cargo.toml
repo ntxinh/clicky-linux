@@ -6,6 +6,29 @@ edition.workspace = true
 license.workspace = true
 default-run = "clicky"
 
+# RPM: `cargo build --release --workspace && cargo generate-rpm -p clicky`
+# (tool: cargo-generate-rpm — no rpmbuild/spec needed; lands in
+# target/generate-rpm/, tools/package.sh copies it to dist/). The udev rule
+# ships in the package; post-install reloads udevd (log out/in or replug to
+# activate the uaccess ACL).
+[package.metadata.generate-rpm]
+summary = "Mechanical keyboard sounds, system-wide on Wayland"
+assets = [
+    { source = "target/release/clicky", dest = "/usr/bin/clicky", mode = "755" },
+    { source = "target/release/clicky-overlay", dest = "/usr/bin/clicky-overlay", mode = "755" },
+    { source = "sounds/**/*", dest = "/usr/share/clicky/sounds/", mode = "644" },
+    { source = "packaging/clicky.desktop", dest = "/usr/share/applications/clicky.desktop", mode = "644" },
+    { source = "packaging/clicky.svg", dest = "/usr/share/icons/hicolor/scalable/apps/clicky.svg", mode = "644" },
+    { source = "udev/99-clicky-uaccess.rules", dest = "/etc/udev/rules.d/99-clicky-uaccess.rules", mode = "644" },
+]
+post_install_script = "udevadm control --reload || true"
+
+# Recommends (not Requires): the tray isn't wired yet — libayatana isn't in
+# the build sysroot. Declared here so the packaged system already has it when
+# the SNI tray lands; upgrade to `requires` at that point.
+[package.metadata.generate-rpm.recommends]
+libayatana-appindicator-gtk3 = "*"
+
 [dependencies]
 clicky-core = { path = "../clicky-core" }
 cpal = "0.15"

@@ -55,7 +55,8 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// `~/.local/share/clicky/sounds`, falling back to `./sounds` for dev runs
-/// (and `../../sounds` under `tauri dev`, which starts in crates/clicky).
+/// (and `../../sounds` under `tauri dev`, which starts in crates/clicky),
+/// then `/usr/share/clicky/sounds` for the RPM install.
 pub fn sounds_dir() -> PathBuf {
     if let Some(p) = directories::ProjectDirs::from("io", "clicky", "clicky") {
         let d = p.data_dir().join("sounds");
@@ -67,6 +68,10 @@ pub fn sounds_dir() -> PathBuf {
         if cand.join("profiles.json").exists() {
             return cand;
         }
+    }
+    let system = PathBuf::from("/usr/share/clicky/sounds");
+    if system.join("profiles.json").exists() {
+        return system;
     }
     PathBuf::from("sounds")
 }

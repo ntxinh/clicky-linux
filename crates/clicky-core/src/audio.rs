@@ -291,6 +291,23 @@ mod tests {
         ));
     }
 
+
+    /// Device hot-swap, single-device variant: `set_device` to the *current*
+    /// device name must succeed and leave a playing stream (stream swap, not
+    /// a restart-from-scratch). Unplug-follow needs a second physical device
+    /// — covered in docs/TESTING.md §8 where hardware allows.
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn set_device_to_current_succeeds() {
+        let Ok((mut audio, _p, _c)) = Audio::start(None) else {
+            return; // headless: skip rather than fail
+        };
+        let name = audio.device_name().to_string();
+        audio.set_device(&name).expect("switch to same device");
+        assert_eq!(audio.device_name(), name);
+        assert!(audio.out_rate() > 0);
+    }
+
     /// Real-hardware path: stream plays, trigger enqueued through the
     /// returned producer renders, and `stats().rendered` grows.
     #[test]

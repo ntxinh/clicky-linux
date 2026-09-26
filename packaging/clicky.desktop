@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Clicky
+Comment=Mechanical keyboard sounds, system-wide on Wayland
+Exec=clicky
+Icon=clicky
+Categories=AudioVideo;Utility;
+Terminal=false
