@@ -1,0 +1,4 @@
+# Local devel sysroot (headers+libs from -devel RPMs, no sudo).
+# Regenerate via tools/sysroot.sh. Harmless if .sysroot is absent (empty path).
+[env]
+PKG_CONFIG_PATH = { value = ".sysroot/usr/lib64/pkgconfig:.sysroot/usr/share/pkgconfig", relative = true, force = false }

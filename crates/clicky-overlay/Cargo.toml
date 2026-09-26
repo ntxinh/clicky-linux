@@ -1,0 +1,13 @@
+[package]
+name = "clicky-overlay"
+description = "gtk4-layer-shell visualizer overlays (keyboard|keystrokes|combo|bezel|keyboard3d)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clicky-core = { path = "../clicky-core" }
+# System libs come from .sysroot/ (tools/sysroot.sh; PKG_CONFIG_PATH is wired
+# in .cargo/config.toml). gtk4-layer-shell 0.8 pairs with gtk4 0.11.
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
