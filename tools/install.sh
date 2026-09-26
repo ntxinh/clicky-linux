@@ -37,6 +37,7 @@ put() { # put <src> <dst>
 }
 
 if [ "$UNINSTALL" = 1 ]; then
+    [ "$DRY" = 1 ] && { echo "--dry-run + --uninstall: would remove bins, sounds, desktop file, icon, autostart"; exit 0; }
     for f in "$BINDIR/clicky" "$BINDIR/clicky-overlay" "$APPS/clicky.desktop" \
              "$ICONS/clicky.svg"; do
         rm -f "$f" && echo "removed $f"
@@ -61,6 +62,7 @@ if [ "$DRY" = 1 ]; then
     echo "  copy sounds/ -> $SHARE/sounds/ ($(find "$ROOT/sounds" -name '*.wav' | wc -l | tr -d ' ') wavs + profiles.json + LICENSES)"
 else
     mkdir -p "$SHARE"
+    rm -rf "$SHARE/sounds"
     cp -r "$ROOT/sounds" "$SHARE/sounds"
 fi
 
@@ -72,8 +74,6 @@ echo "  # then log out/in or replug the keyboard"
 if [ "$DO_UDEV" = 1 ] && [ "$DRY" = 0 ]; then
     sudo cp "$RULE" "$RULE_DST" && sudo udevadm control --reload && sudo udevadm trigger
     echo "udev rule installed — log out/in (or replug) to activate"
-elif [ "$DRY" = 1 ]; then
-    echo "(dry-run: udev commands not run)"
 fi
 
 echo
