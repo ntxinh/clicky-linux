@@ -646,12 +646,16 @@ fn run_app_with(state: AppState, listener: std::os::unix::net::UnixListener) -> 
                 if let tauri::RunEvent::Exit = event {
                     quit.store(true, std::sync::atomic::Ordering::Relaxed);
                     let state = app.state::<AppState>();
+                    {
+                        let mut sh = state.shared.lock();
+                        sh.overlays.kill_all();
+                        if let Err(e) = sh.store.flush() {
+                            eprintln!("clicky: config save: {e}");
+                        }
+                    }
                     if let Some(h) = state.input.lock().take() {
                         let _ = h.join();
                     }
-                    if let Err(e) = state.shared.lock().store.flush() {
-                        eprintln!("clicky: config save: {e}");
-                    };
                     let _ = std::fs::remove_file(daemon::socket_path());
                 }
             });

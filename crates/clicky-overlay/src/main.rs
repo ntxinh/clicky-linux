@@ -111,11 +111,25 @@ fn key_label(page: u8, usage: u16) -> String {
     .into()
 }
 
-/// "7:44 press" → Some((7, 44, pressed)).
-fn parse_line(line: &str) -> Option<(u8, u16, bool)> {
-    let (id, phase) = line.trim().split_once(' ')?;
+/// One parsed FIFO event.
+#[derive(Debug, Clone, Copy)]
+enum Ev {
+    /// (page, usage, pressed)
+    Key(u8, u16, bool),
+    /// "* reset" — daemon's held-set was dropped (SYN_DROPPED); clear all
+    /// pressed/held state.
+    Reset,
+}
+
+/// "7:44 press" / "7:44 release" / "* reset" → Ev.
+fn parse_line(line: &str) -> Option<Ev> {
+    let line = line.trim();
+    if line == "* reset" {
+        return Some(Ev::Reset);
+    }
+    let (id, phase) = line.split_once(' ')?;
     let (p, u) = id.split_once(':')?;
-    Some((p.parse().ok()?, u.parse().ok()?, phase == "press"))
+    Some(Ev::Key(p.parse().ok()?, u.parse().ok()?, phase == "press"))
 }
 
 /// ANSI 15-col board — engine.rs LAYOUT plus y = row (gap under F-row).
@@ -194,9 +208,9 @@ fn open_fifo(path: &Path) -> io::Result<File> {
 
 /// Blocking reader thread → mpsc → main-context drain. (glib 0.22 dropped
 /// `unix_fd_add`; a 10 ms poll is plenty for key events.) `on` runs on the
-/// GTK thread once per parsed `(page, usage, pressed)`.
-fn watch_fifo(file: File, on: impl Fn(u8, u16, bool) + 'static) {
-    let (tx, rx) = std::sync::mpsc::channel::<(u8, u16, bool)>();
+/// GTK thread once per parsed event.
+fn watch_fifo(file: File, on: impl Fn(Ev) + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel::<Ev>();
     std::thread::spawn(move || {
         let mut file = file;
         let mut buf = Vec::new();
@@ -222,8 +236,8 @@ fn watch_fifo(file: File, on: impl Fn(u8, u16, bool) + 'static) {
         }
     });
     glib::timeout_add_local(Duration::from_millis(10), move || {
-        while let Ok((p, u, press)) = rx.try_recv() {
-            on(p, u, press);
+        while let Ok(ev) = rx.try_recv() {
+            on(ev);
         }
         glib::ControlFlow::Continue
     });
@@ -261,14 +275,17 @@ fn anchor(win: &gtk::ApplicationWindow, edges: &[Edge], margin: i32) {
 }
 
 
-fn fifo_path() -> std::path::PathBuf {
+/// This overlay's own FIFO — `events.<kind>` (or a `CLICKY_EVENTS_FIFO`
+/// override for manual testing). Per-kind FIFOs prevent one reader
+/// starving the others on a shared pipe.
+fn fifo_path(kind: &str) -> std::path::PathBuf {
     env::var("CLICKY_EVENTS_FIFO")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| clicky_core::visual::events_fifo())
+        .unwrap_or_else(|_| clicky_core::visual::kind_fifo(kind))
 }
 
-fn fifo_or_exit() -> File {
-    match open_fifo(&fifo_path()) {
+fn fifo_or_exit(kind: &str) -> File {
+    match open_fifo(&fifo_path(kind)) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("clicky-overlay: fifo: {e}");
@@ -299,12 +316,21 @@ fn build_keyboard(app: &gtk::Application) -> gtk::ApplicationWindow {
     anchor(&win, &[Edge::Bottom], 24);
 
     let keys = Rc::new(keys);
-    watch_fifo(fifo_or_exit(), move |_p, u, press| {
-        if let Some(k) = keys.get(&u) {
-            if press {
-                k.add_css_class("pressed");
-            } else {
-                k.remove_css_class("pressed");
+    watch_fifo(fifo_or_exit("keyboard"), move |ev| {
+        match ev {
+            Ev::Key(_, u, press) => {
+                if let Some(k) = keys.get(&u) {
+                    if press {
+                        k.add_css_class("pressed");
+                    } else {
+                        k.remove_css_class("pressed");
+                    }
+                }
+            }
+            Ev::Reset => {
+                for k in keys.values() {
+                    k.remove_css_class("pressed");
+                }
             }
         }
     });
@@ -324,7 +350,14 @@ fn build_keystrokes(app: &gtk::Application) -> gtk::ApplicationWindow {
 
     let held = Rc::new(RefCell::new(0u8));
     let stack = Rc::new(stack);
-    watch_fifo(fifo_or_exit(), move |p, u, press| {
+    watch_fifo(fifo_or_exit("keystrokes"), move |ev| {
+        let (p, u, press) = match ev {
+            Ev::Key(p, u, press) => (p, u, press),
+            Ev::Reset => {
+                *held.borrow_mut() = 0;
+                return;
+            }
+        };
         let mut mask = held.borrow_mut();
         if MOD_USAGES.contains(&u) {
             if press {
@@ -415,7 +448,21 @@ fn build_combo(app: &gtk::Application) -> gtk::ApplicationWindow {
             }
         })
     };
-    watch_fifo(fifo_or_exit(), move |_p, u, press| {
+    watch_fifo(fifo_or_exit("combo"), move |ev| {
+        let (_p, u, press) = match ev {
+            Ev::Key(p, u, press) => (p, u, press),
+            Ev::Reset => {
+                let mut st = state.borrow_mut();
+                st.held = 0;
+                st.count = 0;
+                if let Some(id) = st.timer.take() {
+                    id.remove();
+                }
+                drop(st);
+                render();
+                return;
+            }
+        };
         {
             let mut st = state.borrow_mut();
             if MOD_USAGES.contains(&u) {
@@ -462,7 +509,8 @@ fn build_bezel(app: &gtk::Application) -> gtk::ApplicationWindow {
 
     let frame = Rc::new(frame);
     let timer = Rc::new(RefCell::new(None::<glib::SourceId>));
-    watch_fifo(fifo_or_exit(), move |_p, _u, press| {
+    watch_fifo(fifo_or_exit("bezel"), move |ev| {
+        let press = matches!(ev, Ev::Key(_, _, true));
         if !press {
             return;
         }
@@ -471,9 +519,15 @@ fn build_bezel(app: &gtk::Application) -> gtk::ApplicationWindow {
         }
         frame.add_css_class("pulse");
         let frame2 = frame.clone();
+        let timer2 = timer.clone();
         *timer.borrow_mut() = Some(glib::timeout_add_local_once(
             Duration::from_millis(120),
-            move || frame2.remove_css_class("pulse"),
+            move || {
+                // Clear the slot too — a stale SourceId makes the next
+                // press's remove() hit a dead source (GLib-CRITICAL).
+                *timer2.borrow_mut() = None;
+                frame2.remove_css_class("pulse");
+            },
         ));
     });
     win

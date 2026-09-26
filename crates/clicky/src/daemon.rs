@@ -161,7 +161,19 @@ impl Overlays {
                     self.status.insert(kind.clone(), "running");
                 }
                 Err(e) => {
+                    // Record a failed child so the next sync doesn't retry —
+                    // a spawn-erroring kind would otherwise fork+exec every
+                    // 20 ms tick. Re-enable clears the mark via retain above.
                     eprintln!("clicky: overlay {kind}: {e}");
+                    self.children.insert(
+                        kind.clone(),
+                        OverlayChild {
+                            kind: kind.clone(),
+                            child: None,
+                            restarts: 0,
+                            failed: true,
+                        },
+                    );
                     self.status.insert(kind.clone(), "failed");
                 }
             }
@@ -197,6 +209,18 @@ fn spawn_overlay(kind: &str, vis: &VisualizerSettings) -> std::io::Result<Child>
     cmd.arg(kind)
         .env("CLICKY_COMBO_TIMEOUT", format!("{}", vis.combo_timeout));
     cmd.spawn()
+}
+
+/// Names of currently-enabled overlay kinds — the per-kind FIFO set.
+fn enabled_kinds(vis: &VisualizerSettings) -> Vec<String> {
+    if !vis.enabled {
+        return Vec::new();
+    }
+    vis.kinds
+        .iter()
+        .filter(|(_, on)| **on)
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 /// State mutated by the socket handler (main thread), IPC commands and the
@@ -451,11 +475,21 @@ fn spawn_input(
                         // Key IDs only, never typed text; drops silently
                         // when no overlay is reading the FIFO.
                         if sh.store.cfg.visualizer.any_enabled() {
-                            let _ = sh.visual.emit(&kev);
+                            let kinds = enabled_kinds(&sh.store.cfg.visualizer);
+                            sh.visual.emit(&kev, &kinds);
                         }
                     }
                 }
-                InputEvent::Dropped { device } => normalizer.clear_held(device),
+                InputEvent::Dropped { device } => {
+                    normalizer.clear_held(device);
+                    // Held keys vanished without release events — tell
+                    // overlays to unpress everything so nothing stays lit.
+                    let mut sh = shared.lock();
+                    if sh.store.cfg.visualizer.any_enabled() {
+                        let kinds = enabled_kinds(&sh.store.cfg.visualizer);
+                        sh.visual.reset(&kinds);
+                    }
+                }
             },
             stop,
         );
