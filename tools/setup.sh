@@ -42,6 +42,5 @@ sudo udevadm control --reload
 sudo udevadm trigger
 
 echo
-echo "Done. After re-login/replug, verify with:"
-echo "  getfacl /dev/input/event* | grep \$USER"
-echo "Then uncomment the marked deps in crates/*/Cargo.toml."
+echo "Done. The trigger already re-tagged your keyboards — verify with:"
+echo "  getfacl /dev/input/event* | grep \$USER   (should show your user, rw)"

@@ -70,10 +70,10 @@ echo
 echo "Keyboard access needs the udev uaccess rule (one-time, needs sudo):"
 echo "  sudo cp $RULE $RULE_DST"
 echo "  sudo udevadm control --reload && sudo udevadm trigger"
-echo "  # then log out/in or replug the keyboard"
+echo "  # 'trigger' applies it to already-plugged keyboards — no replug/relogin."
 if [ "$DO_UDEV" = 1 ] && [ "$DRY" = 0 ]; then
     sudo cp "$RULE" "$RULE_DST" && sudo udevadm control --reload && sudo udevadm trigger
-    echo "udev rule installed — log out/in (or replug) to activate"
+    echo "udev rule installed + triggered — keyboards are live now (check getfacl)."
 fi
 
 echo

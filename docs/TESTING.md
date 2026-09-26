@@ -8,11 +8,11 @@ gate for each release.
 
 ## 0. Prerequisites
 
-- [ ] udev uaccess rule installed (one-time, needs sudo — see
-      `tools/install.sh` output):
+- [ ] udev uaccess rule installed (one-time, needs sudo — see INSTALL.md):
       `sudo cp udev/99-clicky-uaccess.rules /etc/udev/rules.d/`,
-      `sudo udevadm control --reload && sudo udevadm trigger`,
-      then log out/in or replug the keyboard.
+      `sudo udevadm control --reload && sudo udevadm trigger`.
+      The `trigger` step re-tags already-plugged keyboards — required; no
+      replug/relogin needed.
 - [ ] `getfacl /dev/input/event*` shows your user has `rw` on the keyboard
       nodes. `clicky --diagnostics` lists readable keyboards, 0 issues.
 - [ ] `~/.local/bin` on PATH (`fish_add_path ~/.local/bin`).
