@@ -1,0 +1,7 @@
+# Toolchain tracks for clicky-linux.
+# `mise install` in the repo root provisions all three.
+# pnpm major tracks the packageManager field in ui/package.json.
+[tools]
+rust = "stable"
+node = "22"
+pnpm = "9"
