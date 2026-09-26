@@ -18,8 +18,25 @@ clicky --daemon   # engine  →  type anywhere, sounds play
 clicky            # settings window (single-instance)
 ```
 
-## Docs
 
+## Development
+
+`mise install` provisions the toolchain (rust stable, node 22, pnpm 9). GTK
+and other `-devel` deps build against a local sysroot — no sudo:
+
+```fish
+bash tools/sysroot.sh   # populates .sysroot/ (auto-wired via .cargo/config.toml)
+make build              # cargo build --workspace
+make test               # unit tests (clicky-core)
+make ui                 # pnpm install + build the settings UI
+make run | daemon       # run the app / headless engine from target/debug
+```
+
+`make help` lists everything (fmt, clippy, diagnostics, install, package…).
+Release gate is the manual matrix in [docs/TESTING.md](docs/TESTING.md).
+Repo conventions and invariants for contributors/agents: [AGENTS.md](AGENTS.md).
+
+## Docs
 | File | What |
 |---|---|
 | [INSTALL.md](INSTALL.md) | Install, the `udevadm trigger` step, troubleshooting silence |
