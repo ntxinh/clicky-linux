@@ -6,8 +6,10 @@
 //!
 //! Kinds: `keyboard` (15-col board, press → amber), `keystrokes` (pill
 //! stack of key NAMES), `combo` (held-modifier symbols + non-mod count),
-//! `bezel` (fullscreen pulsing edge border). All windows are layer
-//! `overlay`, keyboard-mode none, click-through via an empty input region.
+//! `bezel` (fullscreen pulsing edge border), `keyboard3d` (cairo-painted
+//! extruded-board 3D view, drag rotates, presses sink + light amber).
+//! All windows are layer `overlay`, keyboard-mode none; every kind but
+//! `keyboard3d` is click-through via an empty input region.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -243,8 +245,10 @@ fn watch_fifo(file: File, on: impl Fn(Ev) + 'static) {
     });
 }
 
-/// One layer-shell window: overlay layer, no keyboard focus, click-through.
-fn layer_window(app: &gtk::Application, kind: &str) -> gtk::ApplicationWindow {
+/// One layer-shell window: overlay layer, no keyboard focus. `click_through`
+/// empties the input region (keyboard/keystrokes/combo/bezel); `keyboard3d`
+/// keeps pointer input for drag-rotate.
+fn layer_window(app: &gtk::Application, kind: &str, click_through: bool) -> gtk::ApplicationWindow {
     let win = gtk::ApplicationWindow::new(app);
     win.set_decorated(false);
     win.init_layer_shell();
@@ -252,16 +256,18 @@ fn layer_window(app: &gtk::Application, kind: &str) -> gtk::ApplicationWindow {
     win.set_keyboard_mode(KeyboardMode::None);
     let ns = format!("clicky:{kind}");
     win.set_namespace(Some(ns.as_str()));
-    // Click-through: empty input region. GTK resets the region whenever the
-    // surface lays out, so re-apply on its `layout` signal.
-    win.connect_map(|w| {
-        if let Some(surface) = w.surface() {
-            surface.set_input_region(Some(&gtk::cairo::Region::create()));
-            surface.connect_layout(|s, _, _| {
-                s.set_input_region(Some(&gtk::cairo::Region::create()));
-            });
-        }
-    });
+    if click_through {
+        // Empty input region. GTK resets the region whenever the surface
+        // lays out, so re-apply on its `layout` signal.
+        win.connect_map(|w| {
+            if let Some(surface) = w.surface() {
+                surface.set_input_region(Some(&gtk::cairo::Region::create()));
+                surface.connect_layout(|s, _, _| {
+                    s.set_input_region(Some(&gtk::cairo::Region::create()));
+                });
+            }
+        });
+    }
     win
 }
 
@@ -298,7 +304,7 @@ fn fifo_or_exit(kind: &str) -> File {
 fn build_keyboard(app: &gtk::Application) -> gtk::ApplicationWindow {
     const CELL: f64 = 42.0;
     const GAP: f64 = 4.0;
-    let win = layer_window(app, "keyboard");
+    let win = layer_window(app, "keyboard", true);
     let fixed = gtk::Fixed::new();
     fixed.add_css_class("board");
     let step = CELL + GAP;
@@ -342,7 +348,7 @@ fn build_keyboard(app: &gtk::Application) -> gtk::ApplicationWindow {
 fn build_keystrokes(app: &gtk::Application) -> gtk::ApplicationWindow {
     const MAX_PILLS: usize = 5;
     const HOLD_MS: u64 = 1400;
-    let win = layer_window(app, "keystrokes");
+    let win = layer_window(app, "keystrokes", true);
     let stack = gtk::Box::new(gtk::Orientation::Vertical, 0);
     stack.set_halign(gtk::Align::Center);
     win.set_child(Some(&stack));
@@ -410,7 +416,7 @@ fn build_combo(app: &gtk::Application) -> gtk::ApplicationWindow {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(3.0)
         .clamp(0.3, 30.0);
-    let win = layer_window(app, "combo");
+    let win = layer_window(app, "combo", true);
     let pill = gtk::Label::new(None);
     pill.add_css_class("pill");
     pill.add_css_class("hidden-pill");
@@ -499,7 +505,7 @@ fn build_combo(app: &gtk::Application) -> gtk::ApplicationWindow {
 
 /// bezel: fullscreen edge frame that pulses on every key press.
 fn build_bezel(app: &gtk::Application) -> gtk::ApplicationWindow {
-    let win = layer_window(app, "bezel");
+    let win = layer_window(app, "bezel", true);
     let frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     frame.add_css_class("bezel");
     frame.set_hexpand(true);
@@ -533,10 +539,233 @@ fn build_bezel(app: &gtk::Application) -> gtk::ApplicationWindow {
     win
 }
 
+/// keyboard3d: fake-3D board painted in a DrawingArea — extruded key
+/// boxes, yaw/pitch rotation via pointer drag, presses sink the cap and
+/// light the sides amber. No typed text (no labels at all).
+///
+/// ponytail: orthographic projection + painter's sort, no z-buffer —
+/// keys never overlap in depth at sane angles, so per-face sorting is
+/// enough. If free-form tumbling is wanted later, this becomes a real
+/// GL area or gets a depth buffer.
+fn build_keyboard3d(app: &gtk::Application) -> gtk::ApplicationWindow {
+    /// Key travel in units (0..1 of cap height).
+    const TRAVEL: f64 = 0.55;
+    /// Cap height in units.
+    const CAP_H: f64 = 0.42;
+    /// Degrees per drag pixel.
+    const SENS: f64 = 0.35;
+
+    #[derive(Default)]
+    struct St {
+        yaw: f64,
+        pitch: f64,
+        /// usage → depth 0..1 (1 = fully pressed)
+        depth: HashMap<u16, f64>,
+        held: HashMap<u16, bool>,
+    }
+
+    let win = layer_window(app, "keyboard3d", false);
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(680);
+    area.set_content_height(380);
+    area.add_css_class("board");
+    win.set_child(Some(&area));
+    anchor(&win, &[Edge::Top, Edge::Left], 60);
+
+    let st = Rc::new(RefCell::new(St { yaw: -18.0, pitch: 52.0, ..Default::default() }));
+
+    // Drag = rotate. This surface keeps pointer input (unlike the
+    // click-through kinds); niri forwards drags on the overlay layer.
+    {
+        let start = Rc::new(RefCell::new((0.0f64, 0.0f64)));
+        let drag = gtk::GestureDrag::new();
+        {
+            let st2 = st.clone();
+            let start2 = start.clone();
+            drag.connect_drag_begin(move |_, _, _| {
+                let s = st2.borrow();
+                *start2.borrow_mut() = (s.yaw, s.pitch);
+            });
+        }
+        {
+            let st3 = st.clone();
+            let area3 = area.clone();
+            drag.connect_drag_update(move |_, ox, oy| {
+                let (y0, p0) = *start.borrow();
+                let mut s = st3.borrow_mut();
+                s.yaw = y0 + ox * SENS;
+                s.pitch = (p0 - oy * SENS).clamp(-8.0, 85.0);
+                drop(s);
+                area3.queue_draw();
+            });
+        }
+        area.add_controller(drag);
+    }
+
+    // Depth animation advances on the frame clock — queue_draw inside a
+    // draw_func doesn't schedule another frame (the damage clears with
+    // the same snapshot), so animation must live in a tick callback.
+    {
+        let st_tick = st.clone();
+        let area_tick = area.clone();
+        area.add_tick_callback(move |_, _| {
+            let mut s = st_tick.borrow_mut();
+            let mut animating = false;
+            // Iterate the depth map (keys mid-animation), not held —
+            // `held` may be cleared by Reset while a key still has to
+            // spring back up.
+            let keys: Vec<u16> = s.depth.keys().copied().collect();
+            for u in keys {
+                let tgt = if s.held.get(&u).copied().unwrap_or(false) { 1.0 } else { 0.0 };
+                let d = s.depth.entry(u).or_insert(0.0);
+                let nd = *d + (tgt - *d) * 0.35;
+                if (nd - tgt).abs() > 0.01 {
+                    animating = true;
+                    *d = nd;
+                } else if tgt == 0.0 {
+                    s.depth.remove(&u);
+                } else {
+                    *d = tgt;
+                }
+            }
+            if animating {
+                area_tick.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // Shared face painter lives in the draw closure.
+    let st_draw = st.clone();
+    area.set_draw_func(move |_, cr, w, h| {
+        let s = st_draw.borrow();
+
+        let (yaw, pitch) = (s.yaw.to_radians(), s.pitch.to_radians());
+        let (cy, sy, cp, sp) = (yaw.cos(), yaw.sin(), pitch.cos(), pitch.sin());
+        // Board center in cell units.
+        let (cx, cz) = (7.5, 3.25);
+        // Orthographic view: yaw around the up-axis, then pitch about
+        // view-x. det=+1 (a real rotation); z2 grows INTO the screen.
+        let proj = |x: f64, y: f64, z: f64| -> (f64, f64, f64) {
+            let (dx, dz) = (x - cx, z - cz);
+            let x1 = dx * cy - dz * sy;
+            let z1 = dx * sy + dz * cy;
+            let y1 = y * cp - z1 * sp;
+            let z2 = y * sp + z1 * cp;
+            (x1, y1, z2)
+        };
+        // A face is front-facing when its board-space normal rotated
+        // into view space has z2 > 0 — z2 grows TOWARD the camera
+        // (z2 = world·scene→camera), so visible faces point at +z2.
+        let facing = |nx: f64, ny: f64, nz: f64| -> bool {
+            let nz1 = nx * sy + nz * cy;
+            ny * sp + nz1 * cp > 0.0
+        };
+        // Scale cell units to pixels; flip y for cairo's down-positive.
+        let scale = (w as f64 / 17.5).min(h as f64 / 10.0);
+        let (ox, oy) = (w as f64 / 2.0, h as f64 / 2.0 + 0.5 * scale);
+        let to_px = |(x1, y1, _): (f64, f64, f64)| (ox + x1 * scale, oy - y1 * scale);
+
+        // Collect faces: (avg_view_depth, corners, color). Top + 4 sides
+        // per key; sides culled analytically by view-space normal.
+        let mut faces: Vec<(f64, [(f64, f64); 4], (f64, f64, f64))> = Vec::new();
+        for &(u, x, z, kw) in LAYOUT {
+            let (x, z, kw) = (x as f64, z as f64, kw as f64);
+            let d = s.depth.get(&u).copied().unwrap_or(0.0);
+            let pressed = s.held.get(&u).copied().unwrap_or(false);
+            let sink = d * TRAVEL;
+            let (x0, x1) = (x + 0.06, x + kw - 0.06);
+            let (z0, z1) = (z + 0.06, z + 0.94);
+            let top_y = CAP_H - sink;
+            // (quad, color, board-space normal); corners are only for
+            // painting — culling uses the normal, not winding.
+            let quads: [([(f64, f64, f64); 4], (f64, f64, f64), (f64, f64, f64)); 5] = [
+                // top — amber when pressed
+                (
+                    [(x0, top_y, z0), (x1, top_y, z0), (x1, top_y, z1), (x0, top_y, z1)],
+                    if pressed { (1.0, 0.69, 0.13) } else { (0.32, 0.34, 0.40) },
+                    (0.0, 1.0, 0.0),
+                ),
+                // front (+z)
+                (
+                    [(x0, 0.0, z1), (x1, 0.0, z1), (x1, top_y, z1), (x0, top_y, z1)],
+                    if pressed { (0.85, 0.55, 0.08) } else { (0.18, 0.19, 0.23) },
+                    (0.0, 0.0, 1.0),
+                ),
+                // back (-z)
+                (
+                    [(x1, 0.0, z0), (x0, 0.0, z0), (x0, top_y, z0), (x1, top_y, z0)],
+                    (0.14, 0.15, 0.18),
+                    (0.0, 0.0, -1.0),
+                ),
+                // left (-x)
+                (
+                    [(x0, 0.0, z0), (x0, 0.0, z1), (x0, top_y, z1), (x0, top_y, z0)],
+                    (0.16, 0.17, 0.21),
+                    (-1.0, 0.0, 0.0),
+                ),
+                // right (+x)
+                (
+                    [(x1, 0.0, z1), (x1, 0.0, z0), (x1, top_y, z0), (x1, top_y, z1)],
+                    (0.22, 0.23, 0.28),
+                    (1.0, 0.0, 0.0),
+                ),
+            ];
+            for (quad, col, n) in quads {
+                if !facing(n.0, n.1, n.2) {
+                    continue;
+                }
+                let p3: Vec<(f64, f64, f64)> =
+                    quad.iter().map(|&(qx, qy, qz)| proj(qx, qy, qz)).collect();
+                let px: Vec<(f64, f64)> = p3.iter().map(|&p| to_px(p)).collect();
+                let zavg = p3.iter().map(|p| p.2).sum::<f64>() / 4.0;
+                faces.push((zavg, [px[0], px[1], px[2], px[3]], col));
+            }
+        }
+        faces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, quad, (r, g, b)) in faces {
+            cr.move_to(quad[0].0, quad[0].1);
+            for &(px_, py_) in &quad[1..] {
+                cr.line_to(px_, py_);
+            }
+            cr.close_path();
+            cr.set_source_rgb(r, g, b);
+            cr.fill_preserve().expect("fill");
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+            cr.set_line_width(1.0);
+            cr.stroke().expect("stroke");
+        }
+    });
+
+    let st_ev = st.clone();
+    let area_ev = area.clone();
+    watch_fifo(fifo_or_exit("keyboard3d"), move |ev| {
+        if env::var("CLICKY_DEBUG").is_ok() { eprintln!("keyboard3d ev {ev:?}"); }
+        let mut s = st_ev.borrow_mut();
+        match ev {
+            Ev::Key(_, u, true) => {
+                s.held.insert(u, true);
+            }
+            Ev::Key(_, u, false) => {
+                // Remove rather than store `false` — depth already marks
+                // a key mid-animation; a stale false entry is dead weight.
+                s.held.remove(&u);
+            }
+            Ev::Reset => s.held.clear(),
+        }
+        drop(s);
+        area_ev.queue_draw();
+    });
+    win
+}
+
 fn main() -> glib::ExitCode {
     let kind = env::args().nth(1).unwrap_or_default();
-    if !matches!(kind.as_str(), "keyboard" | "keystrokes" | "combo" | "bezel") {
-        eprintln!("usage: clicky-overlay <keyboard|keystrokes|combo|bezel>");
+    if !matches!(
+        kind.as_str(),
+        "keyboard" | "keystrokes" | "combo" | "bezel" | "keyboard3d"
+    ) {
+        eprintln!("usage: clicky-overlay <keyboard|keystrokes|combo|bezel|keyboard3d>");
         std::process::exit(2);
     }
 
@@ -551,6 +780,7 @@ fn main() -> glib::ExitCode {
             "keyboard" => build_keyboard(app),
             "keystrokes" => build_keystrokes(app),
             "combo" => build_combo(app),
+            "keyboard3d" => build_keyboard3d(app),
             _ => build_bezel(app),
         };
         let provider = gtk::CssProvider::new();

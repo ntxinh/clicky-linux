@@ -20,7 +20,13 @@ webview; the daemon is headless when the settings window is closed.
 | `diagnostics` | `--diagnostics`: devices, perm check, measured latency |
 
 `crates/clicky` = thin binary: CLI dispatch + (later) Tauri tray/IPC/UI.
-`crates/clicky-overlay` = gtk4-layer-shell visualizer client.
+`crates/clicky-overlay` = gtk4-layer-shell visualizer client. Kinds
+`keyboard`/`keystrokes`/`combo`/`bezel` are click-through (empty input
+region); `keyboard3d` keeps pointer input — probing this niri 26.04
+session showed overlay-layer surfaces DO receive pointer drags
+(zwlr_virtual_pointer synthetic drag → GtkGestureDrag callbacks), so the
+3D keyboard renders in-process as a cairo-painted DrawingArea with
+drag-rotate rather than falling back to the settings window.
 
 ## Threads
 
